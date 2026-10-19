@@ -13,6 +13,8 @@ Every 15 minutes, **Check source versions** checks the canonical `shukezhinao/ed
 
 Deployment metadata records attempted versions. Failed attempts require an explicit manual retry; they are not retried every poll. Scheduled releases and manual releases share concurrency groups, including desktop recovery. Disabling the `RELEASES_ENABLED` repository variable stops automatic and product release runs while allowing verification.
 
+GitHub [disables public scheduled workflows after 60 days without repository activity](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule). After a successful poll, the scheduler uses this public repository's `GITHUB_TOKEN` to initialize `config/scheduler-activity.json` with the current UTC date, then updates that date through a normal maintenance commit only after at least 30 days. Future dates are preserved. This file contains only the maintenance date; no private source or secrets are committed. The check runs in this public repository on a standard runner and does not use private-repository minutes.
+
 ## Privacy and credentials
 
 - A dedicated GitHub App is installed only on the two private source repositories. Read tokens fetch source; write tokens are issued only for private GitHub Release operations and expire automatically.

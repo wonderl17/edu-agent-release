@@ -4,6 +4,7 @@
 import base64
 import contextlib
 import copy
+from datetime import date
 import importlib.util
 import io
 import json
@@ -181,6 +182,83 @@ class PollTests(unittest.TestCase):
             self.assertEqual(POLL.main(), 31)
         self.assertEqual(stdout.getvalue(), "Release polling started.\nRelease polling failed (code=31).\n")
         self.assertEqual(stderr.getvalue(), "")
+
+
+class SchedulerActivityTests(unittest.TestCase):
+    def setUp(self):
+        self.environment = {"PUBLIC_REPOSITORY": PUBLIC, "PUBLIC_GH_TOKEN": "public_fixture_token"}
+        self.last_maintenance = "2026-10-19"
+        self.calls = []
+        self.sha = "c" * 40
+
+    def api(self, token, method, path, body=None):
+        self.calls.append((token, method, path, copy.deepcopy(body)))
+        if method == "GET":
+            return {
+                "sha": self.sha, "encoding": "base64",
+                "content": base64.b64encode(json.dumps({"last_maintenance": self.last_maintenance}).encode()).decode(),
+            }
+        return {"commit": {"sha": "d" * 40}}
+
+    def test_within_30_days_only_reads_current_public_main_file(self):
+        self.assertFalse(POLL.maintain_scheduler_activity(self.environment, self.api, date(2026, 11, 17)))
+        self.assertEqual(self.calls, [("public_fixture_token", "GET", f"/repos/{PUBLIC}/contents/config/scheduler-activity.json?ref=main", None)])
+
+    def assert_date_only_write(self, expected_date):
+        self.assertEqual(len(self.calls), 2)
+        token, method, path, body = self.calls[1]
+        self.assertEqual(token, "public_fixture_token")
+        self.assertEqual(method, "PUT")
+        self.assertEqual(path, f"/repos/{PUBLIC}/contents/config/scheduler-activity.json")
+        self.assertEqual(set(body), {"message", "content", "sha", "branch"})
+        self.assertEqual(body["sha"], self.sha)
+        self.assertEqual(body["branch"], "main")
+        self.assertEqual(body["message"], "chore: maintain release scheduler activity")
+        self.assertEqual(json.loads(base64.b64decode(body["content"])), {"last_maintenance": expected_date})
+        self.assertNotIn(SENTINEL, json.dumps(self.calls))
+
+    def test_30_day_boundary_updates_only_fixed_file_with_current_sha(self):
+        self.assertTrue(POLL.maintain_scheduler_activity(self.environment, self.api, date(2026, 11, 18)))
+        self.assert_date_only_write("2026-11-18")
+
+    def test_over_30_days_updates_current_date(self):
+        self.assertTrue(POLL.maintain_scheduler_activity(self.environment, self.api, date(2026, 12, 1)))
+        self.assert_date_only_write("2026-12-01")
+
+    def test_null_initial_state_is_initialized_on_first_successful_poll(self):
+        self.last_maintenance = None
+        self.assertTrue(POLL.maintain_scheduler_activity(self.environment, self.api, date(2026, 10, 19)))
+        self.assert_date_only_write("2026-10-19")
+
+    def test_future_date_is_never_moved_backward(self):
+        self.last_maintenance = "2026-12-01"
+        self.assertFalse(POLL.maintain_scheduler_activity(self.environment, self.api, date(2026, 11, 18)))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_api_failure_is_fixed_and_never_exposes_exception_body(self):
+        def failed(*_arguments, **_keywords):
+            raise RuntimeError(SENTINEL)
+        with self.assertRaises(POLL.PollFailure) as failure:
+            POLL.maintain_scheduler_activity(self.environment, failed, date(2026, 11, 18))
+        self.assertEqual(failure.exception.code, 35)
+        self.assertNotIn(SENTINEL, str(failure.exception))
+
+    def test_invalid_public_date_fails_without_writing(self):
+        self.last_maintenance = SENTINEL
+        with self.assertRaises(POLL.PollFailure) as failure:
+            POLL.maintain_scheduler_activity(self.environment, self.api, date(2026, 11, 18))
+        self.assertEqual(failure.exception.code, 35)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_main_maintains_only_after_successful_poll(self):
+        auth = types.SimpleNamespace(github_request=self.api, installation_token=lambda *_args, **_kwargs: "fixture")
+        for failed in (False, True):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.dict(sys.modules, {"release_auth": auth}), patch.dict(os.environ, self.environment), patch.object(Path, "read_text", return_value="{}"), patch.object(POLL, "poll", side_effect=POLL.PollFailure(31) if failed else None) as poll, patch.object(POLL, "maintain_scheduler_activity") as maintain, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                self.assertEqual(POLL.main(), 31 if failed else 0)
+            poll.assert_called_once()
+            self.assertEqual(maintain.call_count, 0 if failed else 1)
+            self.assertNotIn(SENTINEL, stdout.getvalue() + stderr.getvalue())
 
 
 if __name__ == "__main__":

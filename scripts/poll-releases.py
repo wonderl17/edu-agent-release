@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import date, datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,8 @@ ALLOWED_REPOSITORIES = frozenset(("shukezhinao/edu-agent", "wonderl17/edu-agent"
 OPERATIONS = {"cloud": "package.json", "desktop": "apps/desktop/package.json"}
 ENVIRONMENT = "automatic-release"
 MAX_DEPLOYMENT_PAGES = 100
+ACTIVITY_PATH = "config/scheduler-activity.json"
+MAINTENANCE_INTERVAL_DAYS = 30
 SEMVER = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
@@ -184,13 +187,53 @@ def poll(config: Any, environment: dict[str, str], api: Callable, token_for_repo
     return count
 
 
+def maintain_scheduler_activity(environment: dict[str, str], api: Callable, today: date | None = None) -> bool:
+    """Update a date-only public file before GitHub's 60-day idle cutoff."""
+    try:
+        repository = environment["PUBLIC_REPOSITORY"]
+        token = environment["PUBLIC_GH_TOKEN"]
+        if not re.fullmatch(r"wonderl17/[A-Za-z0-9_.-]+", repository) or repository in ALLOWED_REPOSITORIES or not token:
+            raise ValueError()
+        path = f"/repos/{repository}/contents/{ACTIVITY_PATH}"
+        result = api(token, "GET", path + "?ref=main")
+        sha = result["sha"]
+        if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+            raise ValueError()
+        if result["encoding"] != "base64" or not isinstance(result["content"], str) or len(result["content"]) > 4096:
+            raise ValueError()
+        document = json.loads(base64.b64decode("".join(result["content"].split()), validate=True))
+        if not isinstance(document, dict) or set(document) != {"last_maintenance"}:
+            raise ValueError()
+        today = datetime.now(timezone.utc).date() if today is None else today
+        last_maintenance = document["last_maintenance"]
+        if last_maintenance is not None:
+            if not isinstance(last_maintenance, str) or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", last_maintenance) is None:
+                raise ValueError()
+            last_date = date.fromisoformat(last_maintenance)
+            # A future date is preserved; never move the public cursor backward.
+            if (today - last_date).days < MAINTENANCE_INTERVAL_DAYS:
+                return False
+        content = (json.dumps({"last_maintenance": today.isoformat()}, indent=2) + "\n").encode()
+        api(token, "PUT", path, {
+            "message": "chore: maintain release scheduler activity",
+            "content": base64.b64encode(content).decode("ascii"),
+            "sha": sha,
+            "branch": "main",
+        })
+        return True
+    except Exception:
+        raise PollFailure(35) from None
+
+
 def main() -> int:
     print("Release polling started.", flush=True)
     try:
         from release_auth import github_request, installation_token
 
         config = json.loads((Path(__file__).resolve().parents[1] / "config/repositories.json").read_text())
-        poll(config, dict(os.environ), github_request, installation_token)
+        environment = dict(os.environ)
+        poll(config, environment, github_request, installation_token)
+        maintain_scheduler_activity(environment, github_request)
     except PollFailure as error:
         print(f"Release polling failed (code={error.code}).", flush=True)
         return error.code
