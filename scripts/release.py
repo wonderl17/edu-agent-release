@@ -6,10 +6,12 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shutil
 import signal
 import subprocess
 import sys
+import time
 
 from release_auth import REPOSITORIES, github_request, installation_token, stop_process
 
@@ -40,6 +42,75 @@ def run_process(command, environment, cwd=None):
     except BaseException:
         stop_process(process)
         raise
+
+
+def run_probe_process(command, environment, *, capture_stdout=False):
+    """Drain diagnostic output privately, keeping at most 8 KiB per stream."""
+    process = subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE if capture_stdout else subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, start_new_session=True)
+    streams = selectors.DefaultSelector()
+    output = {"stdout": bytearray(), "stderr": bytearray()}
+    for name in output:
+        pipe = getattr(process, name)
+        if pipe is not None:
+            streams.register(pipe, selectors.EVENT_READ, name)
+    deadline = time.monotonic() + 20
+    try:
+        while streams.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, 20)
+            for key, _events in streams.select(remaining):
+                chunk = os.read(key.fileobj.fileno(), 4096)
+                if not chunk:
+                    streams.unregister(key.fileobj)
+                    continue
+                buffer = output[key.data]
+                buffer.extend(chunk[:max(0, 8192 - len(buffer))])
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, 20)
+        return process.wait(timeout=remaining), bytes(output["stdout"]), bytes(output["stderr"])
+    except BaseException:
+        stop_process(process)
+        raise
+    finally:
+        streams.close()
+        for name in output:
+            pipe = getattr(process, name)
+            if pipe is not None:
+                pipe.close()
+
+
+def probe_build_log_access(environment):
+    """Read-only, non-blocking diagnostic with an allowlisted public result."""
+    category = "unavailable"
+    try:
+        code, metadata, _error = run_probe_process([
+            "gcloud", "builds", "list", "--project", "project-cd874991-605d-4143-a62",
+            "--region", "global", "--limit", "1", "--sort-by=~createTime", "--format=json(id)",
+        ], environment, capture_stdout=True)
+        if code == 0:
+            builds = json.loads(metadata)
+            build_id = builds[0].get("id") if isinstance(builds, list) and len(builds) == 1 and isinstance(builds[0], dict) else None
+            if isinstance(build_id, str) and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", build_id):
+                code, _output, error = run_probe_process([
+                    "gcloud", "builds", "log", build_id, "--project", "project-cd874991-605d-4143-a62",
+                    "--region", "global",
+                ], environment)
+                if code == 0:
+                    category = "available"
+                elif any(marker in error.lower() for marker in (
+                    b"permission_denied", b"permission denied", b"permissiondenied", b"access denied",
+                    b"accessdenied", b"forbidden", b"403", b"storage.objects.get",
+                    b"do not have permission", b"does not have permission", b"do not have read access",
+                )):
+                    category = "permission-denied"
+    except Exception:
+        # Cancellation is a BaseException and must still stop the workflow.
+        pass
+    print(f"Cloud Build log access: {category}.", flush=True)
 
 
 def clone_source(repository, sha, token, source):
@@ -137,6 +208,7 @@ def main():
                 "--format=value(metadata.name)",
             ], child, cwd=source):
                 raise RuntimeError("Cloud access verification failed")
+            probe_build_log_access(child)
         if operation in ("cloud", "desktop"):
             package = "package.json" if operation == "cloud" else "apps/desktop/package.json"
             version = json.loads((source / package).read_text())["version"]

@@ -39,6 +39,7 @@ class ControllerTests(unittest.TestCase):
             self.environment[name] = SENTINEL
         self.calls = []
         self.children = []
+        self.probes = []
 
     def clone(self, _repository, _sha, _token, source):
         (source / "apps/desktop").mkdir(parents=True)
@@ -60,7 +61,7 @@ class ControllerTests(unittest.TestCase):
 
     def invoke(self, **changes):
         stdout, stderr = io.StringIO(), io.StringIO()
-        with patch.dict(os.environ, {**self.environment, **changes}, clear=True), patch.object(CONTROLLER, "installation_token", return_value="private_fixture_token") as token, patch.object(CONTROLLER, "clone_source", side_effect=self.clone), patch.object(CONTROLLER, "github_request", side_effect=self.api), patch.object(CONTROLLER, "run_process", side_effect=self.child), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        with patch.dict(os.environ, {**self.environment, **changes}, clear=True), patch.object(CONTROLLER, "installation_token", return_value="private_fixture_token") as token, patch.object(CONTROLLER, "clone_source", side_effect=self.clone), patch.object(CONTROLLER, "github_request", side_effect=self.api), patch.object(CONTROLLER, "run_process", side_effect=self.child), patch.object(CONTROLLER, "probe_build_log_access", side_effect=lambda env: self.probes.append(env)), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = CONTROLLER.main()
         self.assertNotIn(SENTINEL, stdout.getvalue() + stderr.getvalue())
         self.assertEqual(stderr.getvalue(), "")
@@ -92,6 +93,7 @@ class ControllerTests(unittest.TestCase):
             "--format=value(metadata.name)",
         ])
         self.assertEqual(self.children[1][0][-1], "verify")
+        self.assertEqual(len(self.probes), 1)
         self.assertFalse(any(part in ("build", "deploy", "submit") for command, _environment, _cwd in self.children for part in command))
 
     def test_cloud_access_probe_is_only_used_by_verify(self):
@@ -101,6 +103,7 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(code, 0)
             token.assert_called_once_with(SOURCE, "read")
             self.assertFalse(any(command[0] == "gcloud" for command, _environment, _cwd in self.children))
+        self.assertEqual(self.probes, [])
 
     def test_preexisting_workspace_is_preserved(self):
         self.source.mkdir()
@@ -179,8 +182,13 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(unrelated.stdout, "")
 
     def test_process_cancellation_stops_entire_subprocess_group(self):
+        for function in ("run_process", "run_probe_process"):
+            with self.subTest(function=function):
+                self.assert_process_cancellation(function)
+
+    def assert_process_cancellation(self, function):
         child = self.root / "child.py"
-        marker = self.root / "pids.json"
+        marker = self.root / (function + "-pids.json")
         child.write_text(
             "import json, os, pathlib, subprocess, sys, time\n"
             "nested = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
@@ -196,7 +204,7 @@ class ControllerTests(unittest.TestCase):
             "import release\n"
             "signal.signal(signal.SIGTERM, release.cancelled)\n"
             "try:\n"
-            f"    release.run_process([sys.executable, {str(child)!r}], dict(os.environ))\n"
+            f"    release.{function}([sys.executable, {str(child)!r}], dict(os.environ))\n"
             "except release.ReleaseCancelled as error:\n"
             "    raise SystemExit(error.code)\n"
         )
@@ -214,6 +222,75 @@ class ControllerTests(unittest.TestCase):
         for pid in pids:
             state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
             self.assertTrue(not state or state.startswith("Z"), "Private process is still running")
+
+
+class BuildLogProbeTests(unittest.TestCase):
+    build_id = "8906b6b1-5b97-4b25-9f33-72a5bab28945"
+
+    def invoke(self, results):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(CONTROLLER, "run_probe_process", side_effect=results) as run, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            CONTROLLER.probe_build_log_access({"PRIVATE_FIXTURE": SENTINEL})
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertNotIn(SENTINEL, stdout.getvalue())
+        return stdout.getvalue(), run
+
+    def metadata(self):
+        return 0, json.dumps([{"id": self.build_id, "private": SENTINEL}]).encode(), SENTINEL.encode()
+
+    def test_available_reports_only_constant_and_does_not_capture_build_log_stdout(self):
+        output, run = self.invoke([self.metadata(), (0, b"", SENTINEL.encode())])
+        self.assertEqual(output, "Cloud Build log access: available.\n")
+        self.assertEqual(run.call_args_list[0].kwargs, {"capture_stdout": True})
+        self.assertEqual(run.call_args_list[1].kwargs, {})
+        self.assertEqual(run.call_args_list[1].args[0], [
+            "gcloud", "builds", "log", self.build_id, "--project", "project-cd874991-605d-4143-a62", "--region", "global",
+        ])
+        self.assertNotIn(self.build_id, output)
+
+    def test_permission_failure_with_private_details_only_reports_allowlisted_category(self):
+        for diagnostic in (b"ERROR: 403 " + SENTINEL.encode(), b"PermissionDenied: " + SENTINEL.encode(),
+                           b"missing storage.objects.get " + SENTINEL.encode(),
+                           b"You do not have permission " + SENTINEL.encode(),
+                           b"Caller does not have permission " + SENTINEL.encode(),
+                           b"You do not have read access " + SENTINEL.encode()):
+            output, _run = self.invoke([self.metadata(), (1, b"", diagnostic)])
+            self.assertEqual(output, "Cloud Build log access: permission-denied.\n")
+
+    def test_unavailable_and_invalid_metadata_never_fail_verify_or_execute_untrusted_id(self):
+        for result in ((1, SENTINEL.encode(), SENTINEL.encode()),
+                       (0, SENTINEL.encode(), b""),
+                       (0, json.dumps([{"id": SENTINEL}]).encode(), b""),
+                       (0, b"[]", b""),
+                       RuntimeError(SENTINEL)):
+            output, run = self.invoke([result])
+            self.assertEqual(output, "Cloud Build log access: unavailable.\n")
+            self.assertEqual(run.call_count, 1)
+        output, _run = self.invoke([self.metadata(), (1, b"", SENTINEL.encode())])
+        self.assertEqual(output, "Cloud Build log access: unavailable.\n")
+
+    def test_cancellation_propagates_without_printing_private_diagnostics(self):
+        for results in ([CONTROLLER.ReleaseCancelled(143)], [self.metadata(), CONTROLLER.ReleaseCancelled(143)]):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.object(CONTROLLER, "run_probe_process", side_effect=results), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                with self.assertRaises(CONTROLLER.ReleaseCancelled) as caught:
+                    CONTROLLER.probe_build_log_access({})
+            self.assertEqual(caught.exception.code, 143)
+            self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+
+    def test_process_output_is_private_and_bounded(self):
+        code = f"import sys; sys.stdout.write({SENTINEL!r} * 10000); sys.stderr.write({SENTINEL!r} * 10000); sys.exit(1)"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result, captured, error = CONTROLLER.run_probe_process([sys.executable, "-c", code], dict(os.environ), capture_stdout=True)
+        self.assertEqual(result, 1)
+        self.assertEqual(len(captured), 8192)
+        self.assertEqual(len(error), 8192)
+        self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+        result, captured, error = CONTROLLER.run_probe_process([sys.executable, "-c", code], dict(os.environ))
+        self.assertEqual(result, 1)
+        self.assertEqual(captured, b"")
+        self.assertEqual(len(error), 8192)
 
 
 if __name__ == "__main__":
