@@ -1,0 +1,33 @@
+name: Check source versions
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+  deployments: write
+
+concurrency:
+  group: poll-production-release-versions
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    if: github.ref == 'refs/heads/main' && vars.RELEASES_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production-release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check canonical source versions
+        env:
+          PUBLIC_GH_TOKEN: ${{ github.token }}
+          PUBLIC_REPOSITORY: ${{ github.repository }}
+          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: python3 scripts/poll-releases.py

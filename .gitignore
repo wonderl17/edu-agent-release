@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pem
+*.p12
+.env*
+gha-creds-*.json
