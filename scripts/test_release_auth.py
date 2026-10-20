@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError
 
 import release_auth as AUTH
 
@@ -18,6 +19,18 @@ PEM = "-----BEGIN PRIVATE KEY-----\n" + SENTINEL + "\n-----END PRIVATE KEY-----\
 
 
 class AuthTests(unittest.TestCase):
+    def test_optional_not_found_is_limited_to_get_404(self):
+        for method, code, allowed in (("GET", 404, True), ("GET", 403, True),
+                                      ("POST", 404, True), ("GET", 404, False)):
+            with self.subTest(method=method, code=code, allowed=allowed), patch.object(AUTH, "build_opener") as factory:
+                factory.return_value.open.side_effect = HTTPError("private", code, SENTINEL, {}, None)
+                if method == "GET" and code == 404 and allowed:
+                    self.assertIsNone(AUTH.github_request("fixture_token", method, "/fixture", allow_not_found=True))
+                else:
+                    with self.assertRaises(AUTH.ReleaseAuthError) as failure:
+                        AUTH.github_request("fixture_token", method, "/fixture", allow_not_found=allowed)
+                    self.assertEqual(str(failure.exception), "GitHub API request failed")
+
     def test_api_json_and_empty_responses_use_nonredirecting_bearer_request(self):
         response = MagicMock()
         response.__enter__.return_value = response

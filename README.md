@@ -1,13 +1,13 @@
 # edu-agent releases
 
 Public orchestration for `shukezhinao/edu-agent` and `wonderl17/edu-agent`.
-Application code, build scripts, signing material and installation packages stay outside this repository.
+Application code, private build scripts and signing material stay outside this repository. Verified desktop installers are also available as public GitHub Release assets.
 
 ## Run a release
 
 Open **Actions → Release → Run workflow**, select the private source repository and operation, and optionally enter a complete source commit SHA. Only commits in that repository's `main` history are accepted. Leave `confirm_release=no` for `verify`; select `yes` explicitly for `cloud`, `desktop` or `resume`.
 
-`cloud` preserves the existing `all`, `web`, `api` and `worker` targets and migration options. `desktop` builds and signs the existing macOS/Windows packages once, mirrors their original bytes to R2 and publishes to the established COS and private GitHub Release destinations. `resume` restores the original desktop packages without rebuilding.
+`cloud` preserves the existing `all`, `web`, `api` and `worker` targets and migration options. `desktop` builds and signs the existing macOS/Windows packages once, mirrors their original bytes to R2 and publishes to the established COS and private GitHub Release destinations. The controller also copies the three verified installers to this repository’s `desktop-v<version>` Release. `resume` restores the original desktop packages without rebuilding and repeats this installer copy.
 
 Every 15 minutes, **Check source versions** checks the canonical `shukezhinao/edu-agent` main branch. Increasing the root package version queues a cloud release; increasing the desktop package version queues a desktop release. `wonderl17/edu-agent` remains available as a manual source to avoid duplicate releases to the same Production environment. The migration baseline is `0.0.121`; existing versions are not republished. GitHub can delay scheduled runs.
 
@@ -20,7 +20,7 @@ GitHub [disables public scheduled workflows after 60 days without repository act
 - A dedicated GitHub App is installed only on the two private source repositories. Read tokens fetch source; write tokens are issued only for private GitHub Release operations and expire automatically.
 - Only the public controller is checked out by an Actions checkout step. Private source is fetched into a temporary directory and verified against its origin and trusted main history.
 - Private stdout/stderr, exception messages and GitHub file commands never enter public logs, including failed commands. Public logs show fixed phases and status codes. Private temporary logs and source are removed after each run. Diagnose cloud failures in the private Cloud Build/Cloud Run consoles; public logs intentionally contain no build details.
-- No Actions artifacts or Actions caches are uploaded. Packages go directly to the existing authorized release destinations; private GitHub Releases are explicitly addressed to the source repository.
+- No Actions artifacts or Actions caches are uploaded. Existing COS, R2 and private GitHub Release uploads continue. Only `ShukeZhinao-<version>-mac-arm64.pkg`, `-mac-x64.pkg` and `-win-x64.exe` are copied from the selected private Release to this repository’s public Release; size and SHA-256 must match before and after upload. Source archives, logs, source maps, update packages and private release notes are excluded. Identical assets are reused; different bytes under the same name are rejected. Public tags target the controller commit, never the private source commit. The public write token stays outside private execution. A failed private publication remains failed even if its saved installers can be copied; cancellation stops the copy.
 - GCP uses short-lived OIDC credentials restricted to this repository's main branch and exact release workflow. No GCP service-account key is stored here. Credentials are generated outside the private source upload directory.
 - Production credentials live in the `production-release` environment, restricted to `main`. No PR-triggered privileged workflow exists. Official setup actions are pinned to immutable commits.
 

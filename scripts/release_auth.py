@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.error import HTTPError
 
 REPOSITORIES = frozenset(("shukezhinao/edu-agent", "wonderl17/edu-agent"))
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -39,7 +40,7 @@ def stop_process(process):
         process.wait()
 
 
-def github_request(token, method, path, body=None):
+def github_request(token, method, path, body=None, *, allow_not_found=False):
     try:
         if not isinstance(token, str) or BEARER_TOKEN.fullmatch(token) is None:
             raise ValueError()
@@ -61,6 +62,10 @@ def github_request(token, method, path, body=None):
         if len(data) > MAX_RESPONSE_BYTES:
             raise ValueError()
         return json.loads(data) if data else None
+    except HTTPError as error:
+        if allow_not_found and method == "GET" and error.code == 404:
+            return None
+        raise ReleaseAuthError("GitHub API request failed") from None
     except Exception:
         # HTTPError, JSON errors and TLS failures can contain private response
         # data or request details. Never expose those exceptions to a caller.

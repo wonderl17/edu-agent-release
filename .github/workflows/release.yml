@@ -53,7 +53,8 @@ jobs:
       group: ${{ (inputs.operation == 'desktop' || inputs.operation == 'resume') && 'desktop-release-production' || 'cloud-run-production' }}
       cancel-in-progress: false
     permissions:
-      contents: read
+      # Public Release installer assets; the token never enters private code.
+      contents: write
       deployments: write
       id-token: write
     steps:
@@ -144,3 +145,4 @@ jobs:
           find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'release-private-*' -exec rm -rf -- {} +
           find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'release-auth-*' -exec rm -rf -- {} +
           find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'private-desktop-release-*' -exec rm -rf -- {} +
+          find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'installer-mirror-*' -exec rm -rf -- {} +

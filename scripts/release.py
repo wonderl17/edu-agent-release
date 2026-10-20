@@ -14,6 +14,7 @@ import sys
 import time
 
 from release_auth import REPOSITORIES, github_request, installation_token, stop_process
+from mirror_installers import mirror_installers
 
 MODES = frozenset(("cloud", "desktop", "resume", "verify"))
 SEMVER = re.compile(
@@ -148,6 +149,7 @@ def main():
     source_owned = False
     was_cancelled = False
     token = None
+    mirror_token = None
     deployment_id = None
     public_token = os.environ.get("PUBLIC_GH_TOKEN", "")
     public_repository = os.environ.get("PUBLIC_REPOSITORY", "wonderl17/edu-agent-release")
@@ -168,7 +170,7 @@ def main():
             raise ValueError("Invalid target")
         if not re.fullmatch(r"wonderl17/[A-Za-z0-9_.-]+", public_repository) or public_repository in REPOSITORIES:
             raise ValueError("Invalid public repository")
-        if operation in ("cloud", "desktop") and (not public_token or not re.fullmatch(r"[0-9a-f]{40}", os.environ.get("GITHUB_SHA", ""))):
+        if operation in ("cloud", "desktop", "resume") and (not public_token or not re.fullmatch(r"[0-9a-f]{40}", os.environ.get("GITHUB_SHA", ""))):
             raise ValueError("Public release metadata unavailable")
         # Checkout never receives write permission. Desktop entry points refresh
         # a write token through the helper immediately before publishing.
@@ -209,19 +211,28 @@ def main():
             ], child, cwd=source):
                 raise RuntimeError("Cloud access verification failed")
             probe_build_log_access(child)
-        if operation in ("cloud", "desktop"):
+        if operation in ("cloud", "desktop", "resume"):
             package = "package.json" if operation == "cloud" else "apps/desktop/package.json"
             version = json.loads((source / package).read_text())["version"]
             if not isinstance(version, str) or len(version) > 200 or SEMVER.fullmatch(version) is None:
                 raise ValueError("Invalid version")
-            deployment_id = deployment(public_token, public_repository, operation, os.environ["GITHUB_SHA"],
-                                       repository, source_sha, version)
+            if operation in ("cloud", "desktop"):
+                deployment_id = deployment(public_token, public_repository, operation, os.environ["GITHUB_SHA"],
+                                           repository, source_sha, version)
         command = [sys.executable, str(Path(__file__).with_name("private-run.py")), operation]
         print("Release controller stage: private-execution.", flush=True)
         result = run_process(command, child)
         print(f"Private stage exit code: {result:d}.", flush=True)
         if result in (130, 143, -signal.SIGINT, -signal.SIGTERM):
             raise ReleaseCancelled(result if result > 0 else 128 - result)
+        if operation in ("desktop", "resume"):
+            # The private publisher can save installers even if COS fails. Copy
+            # only those verified release assets, without changing that result.
+            print("Release controller stage: public-installers.", flush=True)
+            mirror_token = installation_token(repository, "read")
+            mirror_installers(source_repository=repository, version=version, source_token=mirror_token,
+                              public_repository=public_repository, public_sha=os.environ["GITHUB_SHA"],
+                              public_token=public_token, temporary=temporary)
         if result:
             raise RuntimeError("Private stage failed")
         print("Release controller complete.", flush=True)
@@ -232,6 +243,7 @@ def main():
         print("Release controller cancelled.", flush=True)
         return result
     except BaseException:
+        result = 1
         print("Release controller failed; private diagnostics were withheld.", flush=True)
         return 1
     finally:
@@ -245,11 +257,13 @@ def main():
                                {"state": "success" if result == 0 else "failure", "auto_inactive": False})
             except BaseException:
                 print("Release status recording failed.", flush=True)
-        if token and not was_cancelled:
-            try:
-                github_request(token, "DELETE", "/installation/token")
-            except BaseException:
-                pass
+        if not was_cancelled:
+            for credential in (mirror_token, token):
+                if credential:
+                    try:
+                        github_request(credential, "DELETE", "/installation/token")
+                    except BaseException:
+                        pass
 
 
 if __name__ == "__main__":

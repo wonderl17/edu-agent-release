@@ -40,6 +40,10 @@ class ControllerTests(unittest.TestCase):
         self.calls = []
         self.children = []
         self.probes = []
+        self.mirrors = []
+
+    def mirror(self, **arguments):
+        self.mirrors.append(arguments)
 
     def clone(self, _repository, _sha, _token, source):
         (source / "apps/desktop").mkdir(parents=True)
@@ -61,7 +65,7 @@ class ControllerTests(unittest.TestCase):
 
     def invoke(self, **changes):
         stdout, stderr = io.StringIO(), io.StringIO()
-        with patch.dict(os.environ, {**self.environment, **changes}, clear=True), patch.object(CONTROLLER, "installation_token", return_value="private_fixture_token") as token, patch.object(CONTROLLER, "clone_source", side_effect=self.clone), patch.object(CONTROLLER, "github_request", side_effect=self.api), patch.object(CONTROLLER, "run_process", side_effect=self.child), patch.object(CONTROLLER, "probe_build_log_access", side_effect=lambda env: self.probes.append(env)), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        with patch.dict(os.environ, {**self.environment, **changes}, clear=True), patch.object(CONTROLLER, "installation_token", return_value="private_fixture_token") as token, patch.object(CONTROLLER, "clone_source", side_effect=self.clone), patch.object(CONTROLLER, "github_request", side_effect=self.api), patch.object(CONTROLLER, "run_process", side_effect=self.child), patch.object(CONTROLLER, "mirror_installers", side_effect=self.mirror), patch.object(CONTROLLER, "probe_build_log_access", side_effect=lambda env: self.probes.append(env)), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = CONTROLLER.main()
         self.assertNotIn(SENTINEL, stdout.getvalue() + stderr.getvalue())
         self.assertEqual(stderr.getvalue(), "")
@@ -70,8 +74,9 @@ class ControllerTests(unittest.TestCase):
     def test_controller_passes_refresh_helper_and_records_success_without_public_token(self):
         code, output, token = self.invoke(RELEASE_OPERATION="desktop")
         self.assertEqual(code, 0)
-        self.assertEqual(output, "Release controller stage: auth.\nRelease controller stage: source.\nRelease controller stage: private-execution.\nPrivate stage exit code: 0.\nRelease controller complete.\n")
-        token.assert_called_once_with(SOURCE, "read")
+        self.assertEqual(output, "Release controller stage: auth.\nRelease controller stage: source.\nRelease controller stage: private-execution.\nPrivate stage exit code: 0.\nRelease controller stage: public-installers.\nRelease controller complete.\n")
+        self.assertEqual(token.call_count, 2)
+        self.assertTrue(all(call.args == (SOURCE, "read") for call in token.call_args_list))
         child = self.children[0][1]
         self.assertEqual(child["GH_TOKEN"], "private_fixture_token")
         self.assertEqual(child["RELEASE_APP_PRIVATE_KEY"], SENTINEL)
@@ -94,6 +99,7 @@ class ControllerTests(unittest.TestCase):
         ])
         self.assertEqual(self.children[1][0][-1], "verify")
         self.assertEqual(len(self.probes), 1)
+        self.assertEqual(self.mirrors, [])
         self.assertFalse(any(part in ("build", "deploy", "submit") for command, _environment, _cwd in self.children for part in command))
 
     def test_cloud_access_probe_is_only_used_by_verify(self):
@@ -101,9 +107,47 @@ class ControllerTests(unittest.TestCase):
             self.children.clear()
             code, _output, token = self.invoke(RELEASE_OPERATION=operation)
             self.assertEqual(code, 0)
-            token.assert_called_once_with(SOURCE, "read")
+            self.assertEqual(token.call_count, 1 if operation == "cloud" else 2)
+            self.assertTrue(all(call.args == (SOURCE, "read") for call in token.call_args_list))
             self.assertFalse(any(command[0] == "gcloud" for command, _environment, _cwd in self.children))
         self.assertEqual(self.probes, [])
+
+    def test_desktop_and_resume_mirror_with_separate_credentials_and_public_target(self):
+        for operation in ("desktop", "resume"):
+            self.children.clear()
+            self.mirrors.clear()
+            code, _output, _token = self.invoke(RELEASE_OPERATION=operation)
+            self.assertEqual(code, 0)
+            self.assertEqual(self.mirrors, [{
+                "source_repository": SOURCE, "version": "0.0.123", "source_token": "private_fixture_token",
+                "public_repository": "wonderl17/edu-agent-release", "public_sha": "b" * 40,
+                "public_token": "public_fixture_token", "temporary": self.root.resolve(),
+            }])
+            self.assertNotIn("PUBLIC_GH_TOKEN", self.children[0][1])
+
+    def test_public_mirror_failure_records_failure_and_withholds_diagnostics(self):
+        def failed(**_arguments):
+            raise RuntimeError(SENTINEL)
+        self.mirror = failed
+        code, output, _token = self.invoke(RELEASE_OPERATION="desktop")
+        self.assertEqual(code, 1)
+        self.assertIn("public-installers", output)
+        statuses = [body["state"] for _token, _method, _path, body in self.calls if body and "state" in body]
+        self.assertEqual(statuses, ["failure"])
+        self.assertFalse(self.source.exists())
+
+    def test_private_publish_failure_still_mirrors_installers_and_remains_failed(self):
+        self.child = lambda *_arguments, **_keywords: 22
+        code, _output, _token = self.invoke(RELEASE_OPERATION="desktop")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self.mirrors), 1)
+        self.assertTrue(any(body and body.get("state") == "failure" for _token, _method, _path, body in self.calls))
+
+    def test_cancellation_does_not_start_mirroring(self):
+        self.child = lambda *_arguments, **_keywords: 143
+        code, _output, _token = self.invoke(RELEASE_OPERATION="desktop")
+        self.assertEqual(code, 143)
+        self.assertEqual(self.mirrors, [])
 
     def test_preexisting_workspace_is_preserved(self):
         self.source.mkdir()
