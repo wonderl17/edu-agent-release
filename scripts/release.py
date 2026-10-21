@@ -15,6 +15,7 @@ import time
 
 from release_auth import REPOSITORIES, github_request, installation_token, stop_process
 from mirror_installers import mirror_installers
+from desktop_checkpoints import CheckpointFile, FILE_ENV, report_checkpoints, without_checkpoint_environment
 
 MODES = frozenset(("cloud", "desktop", "resume", "verify"))
 SEMVER = re.compile(
@@ -43,6 +44,26 @@ def run_process(command, environment, cwd=None):
     except BaseException:
         stop_process(process)
         raise
+
+
+def run_private_stage(operation, environment):
+    command = [sys.executable, str(Path(__file__).with_name("private-run.py")), operation]
+    child = without_checkpoint_environment(environment)
+    checkpoint = None
+    try:
+        if operation in ("desktop", "resume") and child.get("RUNNER_TEMP"):
+            try:
+                checkpoint = CheckpointFile(child["RUNNER_TEMP"])
+                child[FILE_ENV] = str(checkpoint.path)
+            except OSError:
+                pass
+        return run_process(command, child)
+    finally:
+        if checkpoint is not None:
+            try:
+                report_checkpoints(checkpoint.path)
+            finally:
+                checkpoint.close()
 
 
 def run_probe_process(command, environment, *, capture_stdout=False):
@@ -219,9 +240,8 @@ def main():
             if operation in ("cloud", "desktop"):
                 deployment_id = deployment(public_token, public_repository, operation, os.environ["GITHUB_SHA"],
                                            repository, source_sha, version)
-        command = [sys.executable, str(Path(__file__).with_name("private-run.py")), operation]
         print("Release controller stage: private-execution.", flush=True)
-        result = run_process(command, child)
+        result = run_private_stage(operation, child)
         print(f"Private stage exit code: {result:d}.", flush=True)
         if result in (130, 143, -signal.SIGINT, -signal.SIGTERM):
             raise ReleaseCancelled(result if result > 0 else 128 - result)

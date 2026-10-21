@@ -143,6 +143,7 @@ jobs:
           set +x
           rm -rf -- "$RUNNER_TEMP/edu-agent-private-source"
           find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'release-private-*' -exec rm -rf -- {} +
+          find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'release-checkpoints-*' -exec rm -rf -- {} +
           find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'release-auth-*' -exec rm -rf -- {} +
           find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'private-desktop-release-*' -exec rm -rf -- {} +
           find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'installer-mirror-*' -exec rm -rf -- {} +

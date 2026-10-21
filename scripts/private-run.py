@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
@@ -11,6 +12,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+
+from desktop_checkpoints import FILE_ENV, validated_checkpoint_path, without_checkpoint_environment
 
 
 ALLOWED_REPOSITORIES = frozenset(("wonderl17/edu-agent", "shukezhinao/edu-agent"))
@@ -64,7 +67,7 @@ def configuration(environment: dict[str, str]) -> tuple[Path, Path, str, str]:
 
 def child_environment(environment: dict[str, str], private: Path, source: Path, repository: str, sha: str) -> dict[str, str]:
     child = {
-        key: value for key, value in environment.items()
+        key: value for key, value in without_checkpoint_environment(environment).items()
         if key.upper() not in REMOVED_ENVIRONMENT
         and not re.search(r"DEBUG|TRACE", key.upper())
     }
@@ -153,6 +156,11 @@ def execute(mode: str, environment: dict[str, str]) -> int:
                 raise ReleaseFailure(22) from None
             if not script.is_file() or not script.is_relative_to(source):
                 raise ReleaseFailure(22)
+            if mode in ("desktop", "resume"):
+                checkpoint = validated_checkpoint_path(environment.get(FILE_ENV), runner_temp)
+                preload = Path(__file__).with_name("desktop-checkpoints.cjs").resolve()
+                if checkpoint is not None and preload.is_file():
+                    child.update({FILE_ENV: str(checkpoint), "NODE_OPTIONS": "--require=" + json.dumps(str(preload))})
             command = ["node", str(script)] if mode == "cloud" else ["bash", str(script), mode]
             code, _ = run_private(command, source=source, environment=child, log=log)
             if code:

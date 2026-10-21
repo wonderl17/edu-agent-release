@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -166,6 +167,49 @@ sys.exit(int(os.environ.get('FIXTURE_EXIT', '0')))
     def test_missing_entry_fails_without_traceback(self):
         (self.source / "scripts/ci-release-cloud.mjs").unlink()
         self.assertEqual(self.invoke().returncode, 22)
+
+    @unittest.skipUnless(shutil.which("node"), "Node is required for checkpoint integration")
+    def test_desktop_checkpoints_cross_the_silent_outer_wrapper_without_private_output(self):
+        node = shutil.which("node")
+        nested = self.source / "scripts/stage-sidecar-runtime.cjs"
+        nested.write_text(
+            "if (!process.env.NODE_OPTIONS || !process.env.RELEASE_DESKTOP_CHECKPOINT_FILE) process.exit(99);\n"
+            f"if(process.env.NODE_OPTIONS.includes({SENTINEL!r})) process.exit(98);\n"
+            f"console.log(process.argv,process.env.PRIVATE_VALUE); throw Error({SENTINEL!r});\n"
+        )
+        (self.source / "scripts/ci-release-desktop.mjs").write_text(
+            "import {spawnSync} from 'node:child_process';\n"
+            f"console.log({SENTINEL!r}); console.error('::error::'+{SENTINEL!r});\n"
+            f"const result=spawnSync(process.execPath,['scripts/stage-sidecar-runtime.cjs',{SENTINEL!r}],"
+            f"{{env:{{NODE_OPTIONS:{SENTINEL!r},PRIVATE_VALUE:{SENTINEL!r}}},stdio:'inherit'}});\n"
+            "process.exitCode=result.status;\n"
+        )
+        (self.source / "scripts/ci-release-desktop.sh").write_text(f'exec "{node}" scripts/ci-release-desktop.mjs\n')
+        self.git("add", ".")
+        self.git("commit", "-m", "Node checkpoint fixture")
+        sha = self.git("rev-parse", "HEAD").strip()
+        self.git("update-ref", "refs/remotes/origin/main", sha)
+        command = (
+            "import os,sys; "
+            f"sys.path.insert(0,{str(RUNNER.parent)!r}); "
+            "import release; raise SystemExit(release.run_private_stage('desktop',dict(os.environ)))"
+        )
+        result = subprocess.run([sys.executable, "-c", command], env={
+            **self.environment, "SOURCE_SHA": sha,
+            "NODE_OPTIONS": "--require=" + SENTINEL,
+        }, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 22, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn(SENTINEL, result.stdout)
+        self.assertIn("Desktop checkpoint: D_ENTRY start.\n", result.stdout)
+        self.assertIn("Desktop checkpoint: D_SIDECAR failure.\n", result.stdout)
+        self.assertIn("Desktop checkpoint: D_ENTRY failure.\n", result.stdout)
+        self.assertEqual(list(self.runner_temp.glob("release-checkpoints-*")), [])
+        self.assertEqual(list(self.runner_temp.glob("release-private-*")), [])
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), sha)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        for path in self.command_files.values():
+            self.assertEqual(path.read_text(), "original")
 
     def test_cancellation_stops_private_process_and_cleans_logs(self):
         process = subprocess.Popen(
