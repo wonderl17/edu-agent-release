@@ -14,7 +14,8 @@ import sys
 import tempfile
 
 from desktop_checkpoints import FILE_ENV, validated_checkpoint_path, without_checkpoint_environment
-from migration_diagnostics import FILE_ENV as MIGRATION_DIAGNOSTICS_ENV, upload_failure_receipt
+from migration_diagnostics import (FILE_ENV as MIGRATION_DIAGNOSTICS_ENV, BUILD_ERROR_ENV,
+                                   BUILD_ERROR_FILE, upload_failure_receipt, upload_failure_build_error)
 
 
 ALLOWED_REPOSITORIES = frozenset(("wonderl17/edu-agent", "shukezhinao/edu-agent"))
@@ -27,6 +28,7 @@ REMOVED_ENVIRONMENT = frozenset((
     "AZURE_CORE_LOG_LEVEL", "NPM_CONFIG_LOGLEVEL", "PNPM_LOG_LEVEL",
     "DOTNET_CLI_CONTEXT_VERBOSE",
     "MIGRATION_BOOTSTRAP_DIAGNOSTICS",
+    "MIGRATION_BOOTSTRAP_BUILD_ERROR",
 ))
 
 
@@ -154,6 +156,10 @@ def execute(mode: str, environment: dict[str, str]) -> int:
             with os.fdopen(descriptor, "w") as stream:
                 json.dump({"schemaVersion": 1, "phase": "preflight", "state": "start", "records": []}, stream)
             child[MIGRATION_DIAGNOSTICS_ENV] = str(receipt)
+            build_error = private / BUILD_ERROR_FILE
+            descriptor = os.open(build_error, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+            child[BUILD_ERROR_ENV] = str(build_error)
         descriptor = os.open(private / "private.log", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "wb", buffering=0) as log:
             verify_source(source, repository, sha, child, log)
@@ -193,6 +199,14 @@ def execute(mode: str, environment: dict[str, str]) -> int:
                         except Exception:
                             # Diagnostics must preserve the migration's original result.
                             public_status("Migration diagnostics: unavailable.")
+                        try:
+                            saved = upload_failure_build_error(private / BUILD_ERROR_FILE, private, environment,
+                                                               private / "migration-diagnostics.json")
+                            public_status("Migration build error: saved." if saved else "Migration build error: unavailable.")
+                        except ReleaseCancelled:
+                            raise
+                        except Exception:
+                            public_status("Migration build error: unavailable.")
                 finally:
                     # Nothing here is an Actions artifact or cache. Keep source
                     # cleanup with the workflow's always() step.

@@ -62,6 +62,7 @@ class PrivateRunTests(unittest.TestCase):
             "GIT_TRACE2_EVENT": SENTINEL,
             "NODE_OPTIONS": "--trace-warnings",
             "CLOUDSDK_CORE_LOG_HTTP": "true",
+            "MIGRATION_BOOTSTRAP_BUILD_ERROR": "/untrusted/external/path",
         })
         self.command_files = {}
         for name in FILE_COMMANDS:
@@ -89,6 +90,10 @@ record = {{
   'file_modes': [stat.S_IMODE(pathlib.Path(os.environ[name]).stat().st_mode) for name in names],
   'file_parents': [str(pathlib.Path(os.environ[name]).parent) for name in names],
   'debug': [name for name in ('DEBUG', 'ACTIONS_STEP_DEBUG', 'ACTIONS_RUNNER_DEBUG', 'GIT_TRACE', 'GIT_TRACE2_EVENT', 'NODE_OPTIONS', 'CLOUDSDK_CORE_LOG_HTTP') if name in os.environ],
+  'build_error': ({{'mode': stat.S_IMODE(pathlib.Path(os.environ['MIGRATION_BOOTSTRAP_BUILD_ERROR']).stat().st_mode),
+                   'size': pathlib.Path(os.environ['MIGRATION_BOOTSTRAP_BUILD_ERROR']).stat().st_size,
+                   'parent': str(pathlib.Path(os.environ['MIGRATION_BOOTSTRAP_BUILD_ERROR']).parent)}}
+                  if os.environ.get('MIGRATION_BOOTSTRAP_BUILD_ERROR') else None),
 }}
 pathlib.Path('observed.json').write_text(json.dumps(record))
 if os.environ.get('FIXTURE_WAIT'):
@@ -120,6 +125,7 @@ sys.exit(int(os.environ.get('FIXTURE_EXIT', '0')))
         self.assertEqual(len(set(record["file_parents"])), 1)
         self.assertEqual(record["debug"], [])
         self.assertEqual(self.source.stat().st_mode & 0o777, 0o700)
+        self.assertIsNone(record["build_error"])
 
     def test_failure_output_and_workflow_commands_are_isolated(self):
         result = self.invoke(FIXTURE_EXIT="7")
@@ -133,6 +139,7 @@ sys.exit(int(os.environ.get('FIXTURE_EXIT', '0')))
         record = json.loads((self.source / "observed.json").read_text())
         self.assertEqual(record["log_mode"], 0o600)
         self.assertEqual(record["debug"], [])
+        self.assertEqual(record["build_error"], {"mode": 0o600, "size": 0, "parent": record["file_parents"][0]})
 
     def test_verify_does_not_execute_release_and_resets_branch_to_main(self):
         self.git("checkout", "--detach", self.sha)
