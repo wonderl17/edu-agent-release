@@ -94,13 +94,19 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(len(self.children), 2)
         self.assertEqual(self.children[0][0], [
             "gcloud", "run", "services", "list",
-            "--project", "project-cd874991-605d-4143-a62", "--region", "asia-east1",
+            "--project", "project-f1f104ee-36ad-451a-9b5", "--region", "asia-east1",
             "--format=value(metadata.name)",
         ])
         self.assertEqual(self.children[1][0][-1], "verify")
         self.assertEqual(len(self.probes), 1)
         self.assertEqual(self.mirrors, [])
         self.assertFalse(any(part in ("build", "deploy", "submit") for command, _environment, _cwd in self.children for part in command))
+
+    def test_cloud_rejects_source_project_before_requesting_private_credentials(self):
+        code, _output, token = self.invoke(GCP_PRODUCTION_PROJECT_ID=CONTROLLER.SOURCE_PROJECT)
+        self.assertEqual(code, 1)
+        token.assert_not_called()
+        self.assertEqual(self.children, [])
 
     def test_verify_authenticates_empty_target_namespace(self):
         code, _output, _token = self.invoke(RELEASE_OPERATION="verify", GCP_PRODUCTION_PROJECT_ID=CONTROLLER.MIGRATION_PROJECT)
@@ -310,7 +316,7 @@ class BuildLogProbeTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[0].kwargs, {"capture_stdout": True})
         self.assertEqual(run.call_args_list[1].kwargs, {})
         self.assertEqual(run.call_args_list[1].args[0], [
-            "gcloud", "builds", "log", self.build_id, "--project", "project-cd874991-605d-4143-a62", "--region", "global",
+            "gcloud", "builds", "log", self.build_id, "--project", "project-f1f104ee-36ad-451a-9b5", "--region", "global",
         ])
         self.assertNotIn(self.build_id, output)
 
