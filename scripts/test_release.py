@@ -102,11 +102,16 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.mirrors, [])
         self.assertFalse(any(part in ("build", "deploy", "submit") for command, _environment, _cwd in self.children for part in command))
 
-    def test_cloud_rejects_source_project_before_requesting_private_credentials(self):
-        code, _output, token = self.invoke(GCP_PRODUCTION_PROJECT_ID=CONTROLLER.SOURCE_PROJECT)
-        self.assertEqual(code, 1)
-        token.assert_not_called()
-        self.assertEqual(self.children, [])
+    def test_gcp_modes_reject_retired_project_before_requesting_private_credentials(self):
+        for operation in ("cloud", "verify", "migration-bootstrap"):
+            with self.subTest(operation=operation):
+                self.children.clear()
+                code, _output, token = self.invoke(RELEASE_OPERATION=operation,
+                                                  GCP_PRODUCTION_PROJECT_ID=CONTROLLER.SOURCE_PROJECT)
+                self.assertEqual(code, 1)
+                token.assert_not_called()
+                self.assertEqual(self.children, [])
+                self.assertEqual(self.probes, [])
 
     def test_verify_authenticates_empty_target_namespace(self):
         code, _output, _token = self.invoke(RELEASE_OPERATION="verify", GCP_PRODUCTION_PROJECT_ID=CONTROLLER.MIGRATION_PROJECT)

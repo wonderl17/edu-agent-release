@@ -24,7 +24,7 @@ MIGRATION_PROJECT = "project-f1f104ee-36ad-451a-9b5"
 
 def production_project(environment):
     project = environment.get("GCP_PRODUCTION_PROJECT_ID") or MIGRATION_PROJECT
-    if project not in (SOURCE_PROJECT, MIGRATION_PROJECT):
+    if project != MIGRATION_PROJECT:
         raise ValueError("Unsupported GCP project")
     return project
 SEMVER = re.compile(
@@ -196,7 +196,7 @@ def main():
             raise ValueError("Confirmation required")
         if requested_sha and not re.fullmatch(r"[0-9a-f]{40}", requested_sha):
             raise ValueError("Full source SHA required")
-        if operation == "cloud" and production_project(os.environ) != MIGRATION_PROJECT:
+        if operation in ("cloud", "verify", "migration-bootstrap") and production_project(os.environ) != MIGRATION_PROJECT:
             raise ValueError("Exact Production project required")
         if operation == "migration-bootstrap" and (
                 not requested_sha or repository != "shukezhinao/edu-agent" or
