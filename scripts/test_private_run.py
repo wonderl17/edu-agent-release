@@ -34,6 +34,7 @@ class PrivateRunTests(unittest.TestCase):
         node.chmod(0o700)
         (self.source / "scripts").mkdir()
         (self.source / "scripts/ci-release-cloud.mjs").write_text(self.child_script())
+        (self.source / "scripts/ci-migration-bootstrap.mjs").write_text(self.child_script())
         (self.source / "scripts/ci-release-desktop.sh").write_text(
             'printf "%s\\n" "' + SENTINEL + '"\n'
             'printf "%s\\n" "' + SENTINEL + '" >&2\n'
@@ -124,6 +125,14 @@ sys.exit(int(os.environ.get('FIXTURE_EXIT', '0')))
         result = self.invoke(FIXTURE_EXIT="7")
         self.assertEqual(result.returncode, 22)
         self.assertEqual(result.stdout, "Release stage: cloud.\nRelease stage failed (code=22).\n")
+
+    def test_migration_bootstrap_reuses_private_output_and_file_command_isolation(self):
+        result = self.invoke("migration-bootstrap")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "Release stage: migration-bootstrap.\nRelease stage complete.\n")
+        record = json.loads((self.source / "observed.json").read_text())
+        self.assertEqual(record["log_mode"], 0o600)
+        self.assertEqual(record["debug"], [])
 
     def test_verify_does_not_execute_release_and_resets_branch_to_main(self):
         self.git("checkout", "--detach", self.sha)

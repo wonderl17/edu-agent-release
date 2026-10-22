@@ -8,7 +8,7 @@ on:
         description: Release operation (verify does not publish)
         type: choice
         default: verify
-        options: [verify, cloud, desktop, resume]
+        options: [verify, cloud, desktop, resume, migration-bootstrap]
       source_repository:
         description: Private source repository
         type: choice
@@ -45,7 +45,9 @@ jobs:
   release:
     if: >-
       github.ref == 'refs/heads/main' &&
-      (inputs.operation == 'verify' || (vars.RELEASES_ENABLED == 'true' && inputs.confirm_release == 'yes'))
+      (inputs.operation == 'verify' ||
+       (inputs.operation == 'migration-bootstrap' && vars.MIGRATION_BOOTSTRAP_ENABLED == 'true' && inputs.confirm_release == 'yes') ||
+       (inputs.operation != 'migration-bootstrap' && vars.RELEASES_ENABLED == 'true' && inputs.confirm_release == 'yes'))
     runs-on: ${{ inputs.operation == 'desktop' && 'macos-latest' || 'ubuntu-latest' }}
     timeout-minutes: 180
     environment: production-release
@@ -86,17 +88,17 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       - name: Authenticate to Production
-        if: inputs.operation == 'cloud' || inputs.operation == 'verify'
+        if: inputs.operation == 'cloud' || inputs.operation == 'verify' || inputs.operation == 'migration-bootstrap'
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
         with:
           workload_identity_provider: ${{ vars.GCP_PRODUCTION_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_PRODUCTION_SERVICE_ACCOUNT_EMAIL }}
-          project_id: project-cd874991-605d-4143-a62
+          project_id: ${{ vars.GCP_PRODUCTION_PROJECT_ID || 'project-cd874991-605d-4143-a62' }}
       - name: Set up gcloud
-        if: inputs.operation == 'cloud' || inputs.operation == 'verify'
+        if: inputs.operation == 'cloud' || inputs.operation == 'verify' || inputs.operation == 'migration-bootstrap'
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
         with:
-          project_id: project-cd874991-605d-4143-a62
+          project_id: ${{ vars.GCP_PRODUCTION_PROJECT_ID || 'project-cd874991-605d-4143-a62' }}
           install_components: beta
       - name: Run isolated private release stage
         env:
@@ -111,6 +113,7 @@ jobs:
           RUN_MIGRATION: ${{ inputs.run_migration }}
           PRE_MIGRATION_REPAIR: ${{ inputs.pre_migration_repair }}
           CONFIRM_RELEASE: ${{ inputs.confirm_release }}
+          GCP_PRODUCTION_PROJECT_ID: ${{ vars.GCP_PRODUCTION_PROJECT_ID || 'project-cd874991-605d-4143-a62' }}
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           DESKTOP_UPDATE_BASE_URL: ${{ vars.DESKTOP_UPDATE_BASE_URL }}

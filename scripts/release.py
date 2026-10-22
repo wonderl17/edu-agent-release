@@ -17,7 +17,16 @@ from release_auth import REPOSITORIES, github_request, installation_token, stop_
 from mirror_installers import mirror_installers
 from desktop_checkpoints import CheckpointFile, FILE_ENV, report_checkpoints, without_checkpoint_environment
 
-MODES = frozenset(("cloud", "desktop", "resume", "verify"))
+MODES = frozenset(("cloud", "desktop", "resume", "verify", "migration-bootstrap"))
+SOURCE_PROJECT = "project-cd874991-605d-4143-a62"
+MIGRATION_PROJECT = "project-f1f104ee-36ad-451a-9b5"
+
+
+def production_project(environment):
+    project = environment.get("GCP_PRODUCTION_PROJECT_ID") or SOURCE_PROJECT
+    if project not in (SOURCE_PROJECT, MIGRATION_PROJECT):
+        raise ValueError("Unsupported GCP project")
+    return project
 SEMVER = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
@@ -110,7 +119,7 @@ def probe_build_log_access(environment):
     category = "unavailable"
     try:
         code, metadata, _error = run_probe_process([
-            "gcloud", "builds", "list", "--project", "project-cd874991-605d-4143-a62",
+            "gcloud", "builds", "list", "--project", production_project(environment),
             "--region", "global", "--limit", "1", "--sort-by=~createTime", "--format=json(id)",
         ], environment, capture_stdout=True)
         if code == 0:
@@ -118,7 +127,7 @@ def probe_build_log_access(environment):
             build_id = builds[0].get("id") if isinstance(builds, list) and len(builds) == 1 and isinstance(builds[0], dict) else None
             if isinstance(build_id, str) and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", build_id):
                 code, _output, error = run_probe_process([
-                    "gcloud", "builds", "log", build_id, "--project", "project-cd874991-605d-4143-a62",
+                    "gcloud", "builds", "log", build_id, "--project", production_project(environment),
                     "--region", "global",
                 ], environment)
                 if code == 0:
@@ -187,11 +196,18 @@ def main():
             raise ValueError("Confirmation required")
         if requested_sha and not re.fullmatch(r"[0-9a-f]{40}", requested_sha):
             raise ValueError("Full source SHA required")
+        if operation == "migration-bootstrap" and (
+                not requested_sha or repository != "shukezhinao/edu-agent" or
+                production_project(os.environ) != MIGRATION_PROJECT or
+                os.environ.get("RUN_MIGRATION") != "false" or
+                os.environ.get("RELEASE_TARGET", "all") != "all" or
+                os.environ.get("PRE_MIGRATION_REPAIR", "none") != "none"):
+            raise ValueError("Explicit private migration target and source required")
         if os.environ.get("RELEASE_TARGET", "all") not in ("all", "api", "worker", "web"):
             raise ValueError("Invalid target")
         if not re.fullmatch(r"wonderl17/[A-Za-z0-9_.-]+", public_repository) or public_repository in REPOSITORIES:
             raise ValueError("Invalid public repository")
-        if operation in ("cloud", "desktop", "resume") and (not public_token or not re.fullmatch(r"[0-9a-f]{40}", os.environ.get("GITHUB_SHA", ""))):
+        if operation in ("cloud", "desktop", "resume", "migration-bootstrap") and (not public_token or not re.fullmatch(r"[0-9a-f]{40}", os.environ.get("GITHUB_SHA", ""))):
             raise ValueError("Public release metadata unavailable")
         # Checkout never receives write permission. Desktop entry points refresh
         # a write token through the helper immediately before publishing.
@@ -226,18 +242,18 @@ def main():
                 if not (source / entry).is_file():
                     raise ValueError("Private release entry unavailable")
             if run_process([
-                "gcloud", "run", "services", "describe", "teaching-api",
-                "--project", "project-cd874991-605d-4143-a62", "--region", "asia-east1",
+                "gcloud", "run", "services", "list",
+                "--project", production_project(child), "--region", "asia-east1",
                 "--format=value(metadata.name)",
             ], child, cwd=source):
                 raise RuntimeError("Cloud access verification failed")
             probe_build_log_access(child)
-        if operation in ("cloud", "desktop", "resume"):
-            package = "package.json" if operation == "cloud" else "apps/desktop/package.json"
+        if operation in ("cloud", "desktop", "resume", "migration-bootstrap"):
+            package = "package.json" if operation in ("cloud", "migration-bootstrap") else "apps/desktop/package.json"
             version = json.loads((source / package).read_text())["version"]
             if not isinstance(version, str) or len(version) > 200 or SEMVER.fullmatch(version) is None:
                 raise ValueError("Invalid version")
-            if operation in ("cloud", "desktop"):
+            if operation in ("cloud", "desktop", "migration-bootstrap"):
                 deployment_id = deployment(public_token, public_repository, operation, os.environ["GITHUB_SHA"],
                                            repository, source_sha, version)
         print("Release controller stage: private-execution.", flush=True)

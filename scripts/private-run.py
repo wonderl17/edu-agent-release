@@ -17,7 +17,7 @@ from desktop_checkpoints import FILE_ENV, validated_checkpoint_path, without_che
 
 
 ALLOWED_REPOSITORIES = frozenset(("wonderl17/edu-agent", "shukezhinao/edu-agent"))
-ALLOWED_MODES = frozenset(("cloud", "desktop", "resume", "verify"))
+ALLOWED_MODES = frozenset(("cloud", "desktop", "resume", "verify", "migration-bootstrap"))
 FILE_COMMANDS = ("GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STEP_SUMMARY", "GITHUB_STATE")
 REMOVED_ENVIRONMENT = frozenset((
     "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "PS4", "PROMPT_COMMAND",
@@ -149,7 +149,7 @@ def execute(mode: str, environment: dict[str, str]) -> int:
             verify_source(source, repository, sha, child, log)
             if mode == "verify":
                 return 0
-            entry = "scripts/ci-release-cloud.mjs" if mode == "cloud" else "scripts/ci-release-desktop.sh"
+            entry = {"cloud": "scripts/ci-release-cloud.mjs", "migration-bootstrap": "scripts/ci-migration-bootstrap.mjs"}.get(mode, "scripts/ci-release-desktop.sh")
             try:
                 script = (source / entry).resolve(strict=True)
             except OSError:
@@ -161,7 +161,7 @@ def execute(mode: str, environment: dict[str, str]) -> int:
                 preload = Path(__file__).with_name("desktop-checkpoints.cjs").resolve()
                 if checkpoint is not None and preload.is_file():
                     child.update({FILE_ENV: str(checkpoint), "NODE_OPTIONS": "--require=" + json.dumps(str(preload))})
-            command = ["node", str(script)] if mode == "cloud" else ["bash", str(script), mode]
+            command = ["node", str(script)] if mode in ("cloud", "migration-bootstrap") else ["bash", str(script), mode]
             code, _ = run_private(command, source=source, environment=child, log=log)
             if code:
                 raise ReleaseFailure(22)

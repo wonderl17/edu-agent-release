@@ -93,7 +93,7 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(any(method == "POST" for _token, method, _path, _body in self.calls))
         self.assertEqual(len(self.children), 2)
         self.assertEqual(self.children[0][0], [
-            "gcloud", "run", "services", "describe", "teaching-api",
+            "gcloud", "run", "services", "list",
             "--project", "project-cd874991-605d-4143-a62", "--region", "asia-east1",
             "--format=value(metadata.name)",
         ])
@@ -101,6 +101,28 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(len(self.probes), 1)
         self.assertEqual(self.mirrors, [])
         self.assertFalse(any(part in ("build", "deploy", "submit") for command, _environment, _cwd in self.children for part in command))
+
+    def test_verify_authenticates_empty_target_namespace(self):
+        code, _output, _token = self.invoke(RELEASE_OPERATION="verify", GCP_PRODUCTION_PROJECT_ID=CONTROLLER.MIGRATION_PROJECT)
+        self.assertEqual(code, 0)
+        self.assertIn(CONTROLLER.MIGRATION_PROJECT, self.children[0][0])
+        self.assertEqual(self.children[0][0][3], "list")
+
+    def test_migration_bootstrap_requires_exact_target_and_explicit_source_without_schema_migration(self):
+        settings = dict(RELEASE_OPERATION="migration-bootstrap", GCP_PRODUCTION_PROJECT_ID=CONTROLLER.MIGRATION_PROJECT,
+                        RUN_MIGRATION="false", PRE_MIGRATION_REPAIR="none")
+        code, output, _token = self.invoke(**settings)
+        self.assertEqual(code, 0)
+        self.assertIn("Release controller complete.", output)
+        self.assertEqual(self.children[0][0][-1], "migration-bootstrap")
+        attempt = next(body for _token, method, path, body in self.calls if method == "POST" and path.endswith("/deployments"))
+        self.assertEqual(attempt["payload"]["version"], "0.0.122")
+        self.assertEqual(attempt["task"], "release-migration-bootstrap")
+        for patch in ({"SOURCE_SHA": ""}, {"RUN_MIGRATION": "true"}, {"GCP_PRODUCTION_PROJECT_ID": CONTROLLER.SOURCE_PROJECT},
+                      {"CONFIRM_RELEASE": "no"}, {"RELEASE_TARGET": "api"}, {"SOURCE_REPOSITORY": "wonderl17/edu-agent"}):
+            code, _output, token = self.invoke(**{**settings, **patch})
+            self.assertEqual(code, 1)
+            token.assert_not_called()
 
     def test_cloud_access_probe_is_only_used_by_verify(self):
         for operation in ("cloud", "desktop", "resume"):
