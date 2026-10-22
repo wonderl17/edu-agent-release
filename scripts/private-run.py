@@ -14,6 +14,7 @@ import sys
 import tempfile
 
 from desktop_checkpoints import FILE_ENV, validated_checkpoint_path, without_checkpoint_environment
+from migration_diagnostics import FILE_ENV as MIGRATION_DIAGNOSTICS_ENV, upload_failure_receipt
 
 
 ALLOWED_REPOSITORIES = frozenset(("wonderl17/edu-agent", "shukezhinao/edu-agent"))
@@ -25,6 +26,7 @@ REMOVED_ENVIRONMENT = frozenset((
     "GIT_CURL_VERBOSE", "CLOUDSDK_CORE_LOG_HTTP", "CLOUDSDK_CORE_VERBOSITY",
     "AZURE_CORE_LOG_LEVEL", "NPM_CONFIG_LOGLEVEL", "PNPM_LOG_LEVEL",
     "DOTNET_CLI_CONTEXT_VERBOSE",
+    "MIGRATION_BOOTSTRAP_DIAGNOSTICS",
 ))
 
 
@@ -138,12 +140,20 @@ def verify_source(source: Path, repository: str, sha: str, environment: dict[str
 
 def execute(mode: str, environment: dict[str, str]) -> int:
     private: Path | None = None
+    succeeded = False
+    was_cancelled = False
     previous_umask = os.umask(0o077)
     try:
         runner_temp, source, repository, sha = configuration(environment)
         private = Path(tempfile.mkdtemp(prefix="release-private-", dir=runner_temp))
         private.chmod(0o700)
         child = child_environment(environment, private, source, repository, sha)
+        if mode == "migration-bootstrap":
+            receipt = private / "migration-diagnostics.json"
+            descriptor = os.open(receipt, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(descriptor, "w") as stream:
+                json.dump({"schemaVersion": 1, "phase": "preflight", "state": "start", "records": []}, stream)
+            child[MIGRATION_DIAGNOSTICS_ENV] = str(receipt)
         descriptor = os.open(private / "private.log", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "wb", buffering=0) as log:
             verify_source(source, repository, sha, child, log)
@@ -165,13 +175,30 @@ def execute(mode: str, environment: dict[str, str]) -> int:
             code, _ = run_private(command, source=source, environment=child, log=log)
             if code:
                 raise ReleaseFailure(22)
+        succeeded = True
         return 0
+    except ReleaseCancelled:
+        was_cancelled = True
+        raise
     finally:
-        if private is not None:
-            # Nothing here is an Actions artifact or cache. Keep source cleanup
-            # with the workflow's always() step so all stages can use it.
-            shutil.rmtree(private, ignore_errors=True)
-        os.umask(previous_umask)
+        try:
+            if private is not None:
+                try:
+                    if mode == "migration-bootstrap" and not succeeded and not was_cancelled:
+                        try:
+                            saved = upload_failure_receipt(private / "migration-diagnostics.json", private, environment)
+                            public_status("Migration diagnostics: saved." if saved else "Migration diagnostics: unavailable.")
+                        except ReleaseCancelled:
+                            raise
+                        except Exception:
+                            # Diagnostics must preserve the migration's original result.
+                            public_status("Migration diagnostics: unavailable.")
+                finally:
+                    # Nothing here is an Actions artifact or cache. Keep source
+                    # cleanup with the workflow's always() step.
+                    shutil.rmtree(private, ignore_errors=True)
+        finally:
+            os.umask(previous_umask)
 
 
 def main() -> int:
