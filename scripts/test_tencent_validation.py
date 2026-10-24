@@ -38,6 +38,17 @@ class ValidationBoundaryTests(unittest.TestCase):
         env["TENCENT_VALIDATION_ENABLED"] = "true"
         self.assertEqual(target.configuration(env)[0], "deploy")
 
+    def test_resume_requires_exact_source_authorization_and_a_bound_prior_ticket(self):
+        env = self.environment(TENCENT_OPERATION="resume", TENCENT_CONFIRM_RELEASE="yes",
+            TENCENT_VALIDATION_ENABLED="true", TENCENT_SOURCE_SHA="b" * 40,
+            TENCENT_PREVIOUS_TRANSFER_TICKET="c" * 32)
+        self.assertEqual(target.configuration(env), ("resume", "b" * 40))
+        for changes in ({"TENCENT_SOURCE_SHA": ""}, {"TENCENT_PREVIOUS_TRANSFER_TICKET": "../escape"},
+                        {"TENCENT_CONFIRM_RELEASE": "no"}, {"TENCENT_VALIDATION_ENABLED": "false"},
+                        {"TENCENT_OPERATION": "deploy"}):
+            with self.subTest(changes=changes), self.assertRaises(target.Failure):
+                target.configuration(dict(env, **changes))
+
     def test_automatic_cannot_inject_a_source_ref(self):
         with self.assertRaises(target.Failure):
             target.configuration(self.environment(TENCENT_OPERATION="automatic",
@@ -61,6 +72,19 @@ class ValidationBoundaryTests(unittest.TestCase):
         self.assertFalse(target.should_deploy("deploy", "0.0.125", remote, "0.0.125", "a" * 40))
         self.assertTrue(target.should_deploy("deploy", "0.0.125", remote, "0.0.125", "b" * 40))
 
+    def test_unhealthy_or_missing_runtime_proof_stops_before_source_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = self.environment(RUNNER_TEMP=directory,
+                TENCENT_VALIDATION_DEPLOY_SSH_KEY="-----BEGIN OPENSSH PRIVATE KEY-----\nsynthetic",
+                TENCENT_VALIDATION_SSH_KNOWN_HOSTS=target.HOST+" ssh-ed25519 AAAATEST")
+            for health in (False, None):
+                with self.subTest(health=health), \
+                        patch.object(target, "remote", return_value={"status": "verified", "configValid": True, "healthy": health}), \
+                        patch.object(target, "installation_token") as source, \
+                        self.assertRaises(target.Failure):
+                    target.execute(env)
+                source.assert_not_called()
+
     def test_disabled_scheduler_does_not_contact_any_target(self):
         with patch.object(target, "remote", side_effect=AssertionError("unexpected SSH")):
             target.execute(self.environment(TENCENT_OPERATION="automatic"))
@@ -70,6 +94,7 @@ class ValidationBoundaryTests(unittest.TestCase):
         override = target.release_request("deploy", "b" * 40, "0.0.125", current)
         self.assertIs(override["allowSameVersionSourceChange"], True)
         self.assertEqual(override["expectedCurrentSourceSha"], "a" * 40)
+        self.assertEqual(target.release_request("resume", "b" * 40, "0.0.125", current), override)
         for operation, version, sha in (("automatic", "0.0.126", "b" * 40),
                                         ("deploy", "0.0.126", "b" * 40),
                                         ("deploy", "0.0.125", "a" * 40)):
