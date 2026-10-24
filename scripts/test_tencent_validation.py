@@ -105,6 +105,38 @@ class ValidationBoundaryTests(unittest.TestCase):
             with self.assertRaises(target.Failure):
                 target.saved_config_ids(path, images, "c" * 40)
 
+    def transfer_ticket(self, sha, size=7):
+        ticket = "b" * 32
+        return {"status": "transfer_prepared", "transferTicket": ticket,
+                "uploadUrl": f"https://{target.TRANSFER_BUCKET}.cos.accelerate.myqcloud.com/teaching-validation/releases/{sha}/{ticket}.tar?q-signature=PRIVATE_SENTINEL",
+                "uploadHeaders": {"Content-Type": "application/octet-stream", "Content-Length": str(size)}}
+
+    def test_private_transfer_streams_only_to_the_bound_cos_object(self):
+        sha = "a" * 40
+        class Response:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def read(self, _): return b""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bundle"; path.write_bytes(b"payload")
+            def upload(request, timeout):
+                self.assertEqual(request.method, "PUT")
+                self.assertEqual(request.get_header("Content-length"), "7")
+                self.assertEqual(request.data.read(4) + request.data.read(4) + request.data.read(4), b"payload")
+                return Response()
+            with patch.object(target, "urlopen", side_effect=upload):
+                self.assertEqual(target.upload_bundle(self.transfer_ticket(sha), path, sha, {"bytes": 7}), "b" * 32)
+            for change in ({"uploadUrl": "https://evil.example/upload"},
+                           {"uploadHeaders": {"Authorization": "unexpected"}},
+                           {"transferTicket": "../escape"}):
+                ticket = dict(self.transfer_ticket(sha), **change)
+                with self.subTest(change=change), patch.object(target, "urlopen") as network, self.assertRaises(target.Failure):
+                    target.upload_bundle(ticket, path, sha, {"bytes": 7})
+                network.assert_not_called()
+            with patch.object(target, "urlopen", side_effect=SystemExit(143)), self.assertRaises(SystemExit):
+                target.upload_bundle(self.transfer_ticket(sha), path, sha, {"bytes": 7})
+
     def test_private_build_cannot_inherit_credentials_or_action_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
