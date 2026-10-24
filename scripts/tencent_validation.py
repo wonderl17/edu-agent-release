@@ -112,7 +112,9 @@ def version_tuple(value):
     return tuple(map(int, value.split(".")))
 
 
-def should_deploy(operation, version, target, baseline):
+def should_deploy(operation, version, target, baseline, source_sha=None):
+    if source_sha is not None and source_sha == target.get("currentSourceSha") and version == target["version"]:
+        return False
     current = version_tuple(version)
     threshold = max(version_tuple(baseline), version_tuple(target["version"]),
                     version_tuple(target.get("lastAttemptedVersion") or target["version"]))
@@ -424,8 +426,8 @@ def execute(env):
                     if operation == "verify":
                         status("Tencent validation: verification complete; no deployment.")
                         return
-                    if not should_deploy(operation, version, target, env.get("TENCENT_VALIDATION_BASELINE_VERSION", "0.0.125")):
-                        status("Tencent validation: no newer version to deploy.")
+                    if not should_deploy(operation, version, target, env.get("TENCENT_VALIDATION_BASELINE_VERSION", "0.0.125"), sha):
+                        status("Tencent validation: no release required.")
                         return
                     base = release_request(operation, sha, version, target)
                     result = remote(ssh, child, log, dict(base, action="record-attempt"))

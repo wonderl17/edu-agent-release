@@ -56,6 +56,11 @@ class ValidationBoundaryTests(unittest.TestCase):
             with self.subTest(value=bad), self.assertRaises(target.Failure):
                 target.version_tuple(bad)
 
+    def test_verified_current_source_is_not_rebuilt_or_replaced(self):
+        remote = {"version": "0.0.125", "currentSourceSha": "a" * 40}
+        self.assertFalse(target.should_deploy("deploy", "0.0.125", remote, "0.0.125", "a" * 40))
+        self.assertTrue(target.should_deploy("deploy", "0.0.125", remote, "0.0.125", "b" * 40))
+
     def test_disabled_scheduler_does_not_contact_any_target(self):
         with patch.object(target, "remote", side_effect=AssertionError("unexpected SSH")):
             target.execute(self.environment(TENCENT_OPERATION="automatic"))
