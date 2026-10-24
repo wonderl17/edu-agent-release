@@ -180,6 +180,7 @@ def remote(ssh, child, log, request, payload=None):
     header = json.dumps(dict(request, protocol=PROTOCOL, sourceRepository=SOURCE), separators=(",", ":")).encode() + b"\n"
     # Prefix and file are streamed through a pipe, never assembled in RAM or a
     # command line. A broken receiver stops the sender and the whole request.
+    log_start = log.tell()
     process = subprocess.Popen(ssh, env=child, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=log, start_new_session=True)
     try:
@@ -196,6 +197,21 @@ def remote(ssh, child, log, request, payload=None):
             process.stdin = None
             output, _ = process.communicate(timeout=5400)
         if process.returncode or len(output) > 128 * 1024:
+            if process.returncode:
+                log.flush()
+                end = log.seek(0, os.SEEK_END)
+                log.seek(max(log_start, end - 128 * 1024))
+                diagnostic = log.read().lower()
+                log.seek(0, os.SEEK_END)
+                for pattern, category in ((b"host key verification failed", "host-pin"),
+                                          (b"permission denied", "authentication"),
+                                          (b"error in libcrypto", "key-format"),
+                                          (b"connection timed out", "connection-timeout"),
+                                          (b"connection refused", "connection-refused"),
+                                          (b"network is unreachable", "network-unreachable")):
+                    if pattern in diagnostic:
+                        status("Tencent validation: SSH failed (" + category + ").")
+                        break
             raise Failure(44)
         result = json.loads(output)
         if not isinstance(result, dict):
