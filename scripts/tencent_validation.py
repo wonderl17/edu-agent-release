@@ -250,6 +250,36 @@ def prepare_build_disk(private, child, log):
         raise Failure(45)
 
 
+def saved_config_ids(path, images, sha):
+    """Use Docker-save config hashes, independent of the daemon's ID type."""
+    expected = {images[kind]["tag"]: kind for kind in ("api", "worker")}
+    result = {}
+    with tarfile.open(path, "r:") as archive:
+        def metadata(name, limit):
+            if not isinstance(name, str) or name.startswith("/") or ".." in name.split("/"):
+                raise Failure(43)
+            member = archive.getmember(name)
+            if not member.isfile() or not 0 < member.size <= limit:
+                raise Failure(43)
+            return archive.extractfile(member).read(limit + 1)
+        entries = json.loads(metadata("manifest.json", 128 * 1024))
+        if not isinstance(entries, list) or len(entries) != 2:
+            raise Failure(43)
+        for entry in entries:
+            tags = entry.get("RepoTags")
+            if not isinstance(tags, list) or len(tags) != 1 or tags[0] not in expected or tags[0] in result:
+                raise Failure(43)
+            raw = metadata(entry["Config"], 1024**2)
+            config = json.loads(raw)
+            if (config.get("os") != "linux" or config.get("architecture") != "amd64" or
+                    config.get("config", {}).get("Labels", {}).get("org.opencontainers.image.revision") != sha):
+                raise Failure(43)
+            result[tags[0]] = "sha256:" + hashlib.sha256(raw).hexdigest()
+    if set(result) != set(expected):
+        raise Failure(43)
+    return {kind: dict(images[kind], id=result[images[kind]["tag"]]) for kind in ("api", "worker")}
+
+
 def build_bundle(source, sha, version, private, child, log):
     prepare_build_disk(private, child, log)
     status("Tencent validation: checking changelog.")
@@ -272,7 +302,8 @@ def build_bundle(source, sha, version, private, child, log):
     for kind in ("api", "worker", "web"):
         status("Tencent validation: building " + kind + ".")
         tag = f"teaching-ai-validation/{kind}:{sha}"
-        command = ["docker", "build", "--label", "org.opencontainers.image.revision=" + sha,
+        command = ["docker", "build", "--platform", "linux/amd64", "--provenance=false", "--sbom=false",
+                   "--label", "org.opencontainers.image.revision=" + sha,
                    "--file", "Dockerfile." + kind, "--tag", tag]
         if kind == "web":
             command += ["--build-arg", "VITE_API_BASE_URL=/api", "--build-arg", "VITE_DEPLOY_ENV=tencent-validation",
@@ -286,6 +317,7 @@ def build_bundle(source, sha, version, private, child, log):
     directory.mkdir(mode=0o700)
     raw_images = private / "images.tar"
     run(["docker", "save", "--output", str(raw_images), images["api"]["tag"], images["worker"]["tag"]], child, log)
+    canonical_images = saved_config_ids(raw_images, images, sha)
     run(["zstd", "-T2", "-3", "--rm", str(raw_images), "-o", str(directory / "images.tar.zst")], child, log)
     container = run(["docker", "create", images["web"]["tag"]], child, log, capture=True).decode().strip()
     if not re.fullmatch(r"[0-9a-f]{64}", container):
@@ -306,7 +338,7 @@ def build_bundle(source, sha, version, private, child, log):
             archive.add(path, arcname=str(path.relative_to(web)), recursive=False, filter=archive_metadata)
     manifest = {"schemaVersion": 1, "deployment": "tencent-validation", "sourceRepository": SOURCE,
                 "sourceSha": sha, "version": version,
-                "images": {name: images[name] for name in ("api", "worker")},
+                "images": canonical_images,
                 "files": {name: digest(directory / name) for name in ("images.tar.zst", "web.tar.gz")}}
     (directory / "manifest.json").write_text(json.dumps(manifest))
     bundle = private / "release-bundle.tar"
