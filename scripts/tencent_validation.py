@@ -50,15 +50,21 @@ def configuration(env):
     operation = env.get("TENCENT_OPERATION", "verify")
     if (env.get("PUBLIC_REPOSITORY") != PUBLIC or
             env.get("GITHUB_REF") != "refs/heads/main" or
-            operation not in ("verify", "deploy", "automatic") or
+            operation not in ("verify", "deploy", "resume", "automatic") or
             not SHA.fullmatch(env.get("GITHUB_SHA", ""))):
         raise Failure(40)
     requested = env.get("TENCENT_SOURCE_SHA", "")
     if requested and not SHA.fullmatch(requested):
         raise Failure(40)
-    if operation == "deploy" and env.get("TENCENT_CONFIRM_RELEASE") != "yes":
+    if operation in ("deploy", "resume") and env.get("TENCENT_CONFIRM_RELEASE") != "yes":
         raise Failure(40)
-    if operation == "deploy" and env.get("TENCENT_VALIDATION_ENABLED") != "true":
+    if operation in ("deploy", "resume") and env.get("TENCENT_VALIDATION_ENABLED") != "true":
+        raise Failure(40)
+    previous_ticket = env.get("TENCENT_PREVIOUS_TRANSFER_TICKET", "")
+    if operation == "resume":
+        if not requested or not re.fullmatch(r"[0-9a-f]{32}", previous_ticket):
+            raise Failure(40)
+    elif previous_ticket:
         raise Failure(40)
     if operation == "automatic" and requested:
         raise Failure(40)
@@ -118,14 +124,14 @@ def should_deploy(operation, version, target, baseline, source_sha=None):
     current = version_tuple(version)
     threshold = max(version_tuple(baseline), version_tuple(target["version"]),
                     version_tuple(target.get("lastAttemptedVersion") or target["version"]))
-    return operation == "deploy" or (operation == "automatic" and current > threshold)
+    return operation in ("deploy", "resume") or (operation == "automatic" and current > threshold)
 
 
 def release_request(operation, sha, version, target):
     if version_tuple(version) < version_tuple(target["version"]):
         raise Failure(41)
     request = {"sourceSha": sha, "version": version}
-    if (operation == "deploy" and version == target["version"] and
+    if (operation in ("deploy", "resume") and version == target["version"] and
             sha != target["currentSourceSha"]):
         request.update(expectedCurrentSourceSha=target["currentSourceSha"],
                        allowSameVersionSourceChange=True)
@@ -413,7 +419,8 @@ def execute(env):
                 try:
                     status("Tencent validation: checking target.")
                     target = remote(ssh, child, log, {"action": "verify", "sourceSha": sha, "version": version})
-                    if target.get("status") != "verified" or target.get("configValid") is not True:
+                    if (target.get("status") != "verified" or target.get("configValid") is not True or
+                            target.get("healthy") is not True):
                         raise Failure(44)
                     status("Tencent validation: checking trusted private source.")
                     token = installation_token(SOURCE, permission="read")
@@ -439,13 +446,26 @@ def execute(env):
                         "payload": {"source_repository": SOURCE, "source_sha": sha, "version": version,
                                     "operation": "tencent-validation"},
                     })["id"]
-                    bundle = build_bundle(source, sha, version, private, child, log)
-                    metadata = digest(bundle)
-                    status("Tencent validation: preparing private transfer.")
-                    ticket = remote(ssh, child, log, dict(base, action="prepare-transfer",
-                                                        bundleBytes=metadata["bytes"], bundleSha256=metadata["sha256"]))
-                    status("Tencent validation: uploading private release package.")
-                    identity = upload_bundle(ticket, bundle, sha, metadata)
+                    if operation == "resume":
+                        status("Tencent validation: recovering original private release package.")
+                        ticket = remote(ssh, child, log, dict(base, action="resume-transfer",
+                            previousTransferTicket=env["TENCENT_PREVIOUS_TRANSFER_TICKET"]))
+                        if (ticket.get("status") != "transfer_resumed" or
+                                not re.fullmatch(r"[0-9a-f]{32}", ticket.get("transferTicket", "")) or
+                                type(ticket.get("bundleBytes")) is not int or
+                                not 0 < ticket["bundleBytes"] <= 5 * 1024**3 or
+                                not re.fullmatch(r"[0-9a-f]{64}", ticket.get("bundleSha256", ""))):
+                            raise Failure(47)
+                        metadata = {"bytes": ticket["bundleBytes"], "sha256": ticket["bundleSha256"]}
+                        identity = ticket["transferTicket"]
+                    else:
+                        bundle = build_bundle(source, sha, version, private, child, log)
+                        metadata = digest(bundle)
+                        status("Tencent validation: preparing private transfer.")
+                        ticket = remote(ssh, child, log, dict(base, action="prepare-transfer",
+                                                            bundleBytes=metadata["bytes"], bundleSha256=metadata["sha256"]))
+                        status("Tencent validation: uploading private release package.")
+                        identity = upload_bundle(ticket, bundle, sha, metadata)
                     status("Tencent validation: applying and verifying isolated release.")
                     result = remote(ssh, child, log, dict(base, action="deploy", bundleBytes=metadata["bytes"],
                                                         bundleSha256=metadata["sha256"], transferTicket=identity))

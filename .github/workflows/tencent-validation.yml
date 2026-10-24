@@ -10,7 +10,7 @@ on:
         description: Verify only, deploy an exact trusted source, or check versions
         type: choice
         default: verify
-        options: [verify, deploy, automatic]
+        options: [verify, deploy, resume, automatic]
       source_sha:
         description: Full canonical main-history SHA; empty resolves main once
         type: string
@@ -20,6 +20,10 @@ on:
         type: choice
         default: 'no'
         options: ['no', 'yes']
+      previous_transfer_ticket:
+        description: Prior validation transfer ticket for an exact-source original-package resume
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -61,5 +65,6 @@ jobs:
           TENCENT_OPERATION: ${{ inputs.operation || 'automatic' }}
           TENCENT_SOURCE_SHA: ${{ inputs.source_sha }}
           TENCENT_CONFIRM_RELEASE: ${{ inputs.confirm_release }}
+          TENCENT_PREVIOUS_TRANSFER_TICKET: ${{ inputs.previous_transfer_ticket }}
         run: python3 scripts/tencent_validation.py
 
