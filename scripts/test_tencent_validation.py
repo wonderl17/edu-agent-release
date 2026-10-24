@@ -100,13 +100,14 @@ class ValidationBoundaryTests(unittest.TestCase):
     def test_strict_host_pinning_and_no_ssh_agent(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            env = {"TENCENT_VALIDATION_DEPLOY_SSH_KEY": "-----BEGIN OPENSSH PRIVATE KEY-----\nprivate\n",
+            env = {"TENCENT_VALIDATION_DEPLOY_SSH_KEY": "-----BEGIN OPENSSH PRIVATE KEY-----\nprivate",
                    "TENCENT_VALIDATION_SSH_KNOWN_HOSTS": target.HOST + " ssh-ed25519 AAAATEST"}
             args = target.ssh_configuration(env, root)
             self.assertIn("StrictHostKeyChecking=yes", args)
             self.assertIn("IdentitiesOnly=yes", args)
             self.assertEqual(args[-1], target.USER + "@" + target.HOST)
             self.assertEqual((root / "deploy.key").stat().st_mode & 0o777, 0o600)
+            self.assertTrue((root / "deploy.key").read_bytes().endswith(b"\n"))
         for host in ("*", "shukezhinao.321weiqi.com", "49.233.166.202,other"):
             with tempfile.TemporaryDirectory() as directory, self.assertRaises(target.Failure):
                 target.ssh_configuration(dict(env, TENCENT_VALIDATION_SSH_KNOWN_HOSTS=host + " ssh-ed25519 AA"), Path(directory))
