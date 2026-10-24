@@ -1,0 +1,67 @@
+name: Tencent Production
+run-name: Tencent Production · ${{ inputs.operation }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Verify, stage a complete package without activation, deploy, or resume
+        type: choice
+        default: verify
+        options: [verify, stage, deploy, resume]
+      source_sha:
+        description: Full canonical main-history SHA; required for stage/resume
+        type: string
+        default: ''
+      confirm_release:
+        description: Authorize deployment to the Tencent Production site only
+        type: choice
+        default: 'no'
+        options: ['no', 'yes']
+      previous_transfer_ticket:
+        description: Prior Production stage/release ticket for exact-source original-package resume
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tencent-production-release
+  cancel-in-progress: false
+
+jobs:
+  production:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    # Source deploy keys are prohibited by the private repository. This uses
+    # its existing App authentication, requesting read access to one repo only.
+    # No GCP, desktop signing, storage access keys or OIDC enter this workflow.
+    environment: production-release
+    permissions:
+      contents: read
+      deployments: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Run fixed Tencent Production controller
+        env:
+          RELEASES_ENABLED: ${{ vars.RELEASES_ENABLED }}
+          PUBLIC_GH_TOKEN: ${{ github.token }}
+          PUBLIC_REPOSITORY: ${{ github.repository }}
+          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          TENCENT_PRODUCTION_DEPLOY_SSH_KEY: ${{ secrets.TENCENT_PRODUCTION_DEPLOY_SSH_KEY }}
+          TENCENT_PRODUCTION_SSH_KNOWN_HOSTS: ${{ vars.TENCENT_PRODUCTION_SSH_KNOWN_HOSTS }}
+          TENCENT_PRODUCTION_ENABLED: ${{ vars.TENCENT_PRODUCTION_ENABLED }}
+          TENCENT_PRODUCTION_BASELINE_VERSION: ${{ vars.TENCENT_PRODUCTION_BASELINE_VERSION }}
+          TENCENT_OPERATION: ${{ inputs.operation }}
+          TENCENT_SOURCE_SHA: ${{ inputs.source_sha }}
+          TENCENT_CONFIRM_RELEASE: ${{ inputs.confirm_release }}
+          TENCENT_PREVIOUS_TRANSFER_TICKET: ${{ inputs.previous_transfer_ticket }}
+        run: python3 scripts/tencent_production.py
