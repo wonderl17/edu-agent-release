@@ -357,11 +357,15 @@ def execute(env):
                                                         bundleSha256=metadata["sha256"]), bundle)
                     if result.get("status") != "deployed" or result.get("version") != version or result.get("sourceSha") != sha:
                         raise Failure(44)
-                    github_request(env["PUBLIC_GH_TOKEN"], "POST", f"/repos/{PUBLIC}/deployments/{deployment_id}/statuses", {
-                        "state": "success", "environment_url": SITE, "auto_inactive": False,
-                        "description": "Tencent validation target verified; Production unchanged.",
-                    })
                     deployed = True
+                    try:
+                        github_request(env["PUBLIC_GH_TOKEN"], "POST", f"/repos/{PUBLIC}/deployments/{deployment_id}/statuses", {
+                            "state": "success", "environment_url": SITE, "auto_inactive": False,
+                            "description": "Tencent validation target verified; Production unchanged.",
+                        })
+                    except Exception:
+                        status("Tencent validation: target verified; deployment metadata update failed.")
+                        raise Failure(46)
                     status("Tencent validation: deployment and verification complete.")
                 except BaseException as error:
                     if operation != "verify" and not isinstance(error, (SystemExit, KeyboardInterrupt)):
