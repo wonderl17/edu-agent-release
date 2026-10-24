@@ -38,7 +38,7 @@ jobs:
     # Source deploy keys are prohibited by the private repository. This uses
     # its existing App authentication, requesting read access to one repo only.
     # No GCP, desktop signing, storage access keys or OIDC enter this workflow.
-    environment: tencent-production-release
+    environment: production-release
     permissions:
       contents: read
       deployments: write
@@ -65,4 +65,3 @@ jobs:
           TENCENT_CONFIRM_RELEASE: ${{ inputs.confirm_release }}
           TENCENT_PREVIOUS_TRANSFER_TICKET: ${{ inputs.previous_transfer_ticket }}
         run: python3 scripts/tencent_production.py
-

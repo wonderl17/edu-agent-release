@@ -169,7 +169,7 @@ class ProductionStageTests(unittest.TestCase):
                           "https://shukezhinao.321weiqi.com"))
         root = Path(__file__).parent.parent
         production = (root / ".github/workflows/tencent-production.yml").read_text()
-        self.assertIn("environment: tencent-production-release", production)
+        self.assertIn("environment: production-release", production)
         self.assertNotIn("TENCENT_VALIDATION", production)
         self.assertNotIn("id-token:", production)
         self.assertNotIn("google-github-actions/", production)
