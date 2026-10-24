@@ -16,6 +16,8 @@ import subprocess
 import tarfile
 import tempfile
 import time
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 from release_auth import github_request, installation_token, stop_process
 
@@ -25,6 +27,7 @@ HOST = "49.233.166.202"
 USER = "teaching-validation-ci"
 SITE = "https://test-shukezhinao.321weiqi.com"
 PROTOCOL = "teaching-validation-ci-v1"
+TRANSFER_BUCKET = "teaching-validation-releases-1331158445"
 SHA = re.compile(r"[0-9a-f]{40}")
 VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
@@ -230,6 +233,42 @@ def digest(path):
     return {"bytes": path.stat().st_size, "sha256": result.hexdigest()}
 
 
+def upload_bundle(ticket, bundle, sha, metadata):
+    """One short-lived private COS PUT; no cloud credential enters this job."""
+    identity = ticket.get("transferTicket")
+    if (ticket.get("status") != "transfer_prepared" or not isinstance(identity, str) or
+            not re.fullmatch(r"[0-9a-f]{32}", identity) or metadata["bytes"] > 5 * 1024**3):
+        raise Failure(47)
+    url = ticket.get("uploadUrl", "")
+    parsed = urlsplit(url)
+    hosts = {TRANSFER_BUCKET + ".cos.accelerate.myqcloud.com",
+             TRANSFER_BUCKET + ".cos.ap-beijing.myqcloud.com"}
+    if (parsed.scheme != "https" or parsed.hostname not in hosts or parsed.port is not None or
+            parsed.username or parsed.password or parsed.fragment or not parsed.query or
+            parsed.path != f"/teaching-validation/releases/{sha}/{identity}.tar"):
+        raise Failure(47)
+    headers = {"Content-Type": "application/octet-stream", "Content-Length": str(metadata["bytes"])}
+    if ticket.get("uploadHeaders") != headers:
+        raise Failure(47)
+    deadline = time.monotonic() + 3600
+    with bundle.open("rb") as handle:
+        class Body:
+            def read(self, size=-1):
+                if time.monotonic() > deadline:
+                    raise Failure(47)
+                return handle.read(min(size, 1024**2) if size >= 0 else 1024**2)
+        try:
+            # Never log a presigned URL, response body, headers or exception text.
+            request = Request(url, data=Body(), headers=headers, method="PUT")
+            with urlopen(request, timeout=120) as response:
+                if response.status != 200:
+                    raise Failure(47)
+                response.read(4096)
+        except Exception:
+            raise Failure(47)
+    return identity
+
+
 def archive_metadata(info):
     info.uid = info.gid = 0
     info.uname = info.gname = ""
@@ -400,9 +439,14 @@ def execute(env):
                     })["id"]
                     bundle = build_bundle(source, sha, version, private, child, log)
                     metadata = digest(bundle)
-                    status("Tencent validation: transferring and applying isolated release.")
+                    status("Tencent validation: preparing private transfer.")
+                    ticket = remote(ssh, child, log, dict(base, action="prepare-transfer",
+                                                        bundleBytes=metadata["bytes"], bundleSha256=metadata["sha256"]))
+                    status("Tencent validation: uploading private release package.")
+                    identity = upload_bundle(ticket, bundle, sha, metadata)
+                    status("Tencent validation: applying and verifying isolated release.")
                     result = remote(ssh, child, log, dict(base, action="deploy", bundleBytes=metadata["bytes"],
-                                                        bundleSha256=metadata["sha256"]), bundle)
+                                                        bundleSha256=metadata["sha256"], transferTicket=identity))
                     if result.get("status") != "deployed" or result.get("version") != version or result.get("sourceSha") != sha:
                         raise Failure(44)
                     deployed = True
@@ -419,9 +463,9 @@ def execute(env):
                     if operation != "verify" and not isinstance(error, (SystemExit, KeyboardInterrupt)):
                         try:
                             log.flush()
-                            log.seek(max(0, log.seek(0, os.SEEK_END) - 5 * 1024**2))
+                            log.seek(max(0, log.seek(0, os.SEEK_END) - 128 * 1024))
                             diagnostic = private / "diagnostic.log"
-                            private_file(diagnostic, log.read(5 * 1024**2))
+                            private_file(diagnostic, log.read(128 * 1024))
                             data = digest(diagnostic)
                             remote(ssh, child, log, {"action": "diagnostics", "sourceSha": sha, "version": version,
                                                     "bundleBytes": data["bytes"], "bundleSha256": data["sha256"],
