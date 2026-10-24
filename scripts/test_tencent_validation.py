@@ -1,7 +1,11 @@
 import importlib.util
+import hashlib
+import io
+import json
 import os
 from pathlib import Path
 import tempfile
+import tarfile
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -80,6 +84,26 @@ class ValidationBoundaryTests(unittest.TestCase):
                 patch.object(target, "run") as command:
             target.prepare_build_disk(Path("/private"), {}, None)
             command.assert_not_called()
+
+    def test_docker_manifest_ids_are_not_confused_with_saved_config_ids(self):
+        sha = "a" * 40
+        raw = json.dumps({"os": "linux", "architecture": "amd64", "config": {
+            "Labels": {"org.opencontainers.image.revision": sha}}}).encode()
+        images = {kind: {"tag": "teaching-ai-validation/" + kind + ":" + sha,
+                         "id": "sha256:" + "b" * 64} for kind in ("api", "worker")}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "images.tar"
+            with tarfile.open(path, "w") as archive:
+                manifest = json.dumps([{"Config": kind + ".json", "RepoTags": [images[kind]["tag"]]}
+                                       for kind in images]).encode()
+                for name, body in [("manifest.json", manifest), ("api.json", raw), ("worker.json", raw)]:
+                    member = tarfile.TarInfo(name); member.size = len(body)
+                    archive.addfile(member, io.BytesIO(body))
+            result = target.saved_config_ids(path, images, sha)
+            self.assertEqual(result["api"]["id"], "sha256:" + hashlib.sha256(raw).hexdigest())
+            self.assertNotEqual(result["api"]["id"], images["api"]["id"])
+            with self.assertRaises(target.Failure):
+                target.saved_config_ids(path, images, "c" * 40)
 
     def test_private_build_cannot_inherit_credentials_or_action_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
