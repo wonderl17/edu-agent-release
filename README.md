@@ -21,6 +21,12 @@ The explicitly authorized build-submit exception uses a separate controller-crea
 
 GitHub [disables public scheduled workflows after 60 days without repository activity](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule). After a successful poll, the scheduler uses this public repository's `GITHUB_TOKEN` to initialize `config/scheduler-activity.json` with the current UTC date, then updates that date through a normal maintenance commit only after at least 30 days. Future dates are preserved. This file contains only the maintenance date; no private source or secrets are committed. The check runs in this public repository on a standard runner and does not use private-repository minutes.
 
+## Tencent validation
+
+**Actions → Tencent validation** manages only the fixed Tencent validation host. `verify` checks access without building or deploying; `deploy` requires `confirm_release=yes` and an exact canonical `main` history commit (or resolves `main` once). It builds private source in isolated containers, transfers a checksum-verified package over a dedicated forced-command SSH identity, captures a fresh recoverable snapshot, applies additive database migrations, and verifies the running API, workers and Web. Source and build logs are never published. Bounded failure logs stay in a fixed root-only directory on the validation host; cancellation stops execution and skips diagnostic uploads.
+
+The separate `TENCENT_VALIDATION_ENABLED` and `TENCENT_VALIDATION_AUTOMATIC_ENABLED` environment variables gate manual deployment and scheduled version checks. Its baseline is `0.0.125`; failed scheduled versions require manual retry. An explicitly selected manual deployment may change the source SHA at the current version, guarded by the expected running SHA; downgrades are refused. This workflow shares only the existing App source-authentication environment and requests a read-only token for `shukezhinao/edu-agent`. It has no GCP/OIDC permissions, uses a separate concurrency group and non-production deployment metadata, and does not change Production DNS or services.
+
 ## Privacy and credentials
 
 - A dedicated GitHub App is installed only on the two private source repositories. Read tokens fetch source; write tokens are issued only for private GitHub Release operations and expire automatically.
