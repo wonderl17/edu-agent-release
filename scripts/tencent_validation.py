@@ -143,7 +143,7 @@ def ssh_configuration(env, private):
         if len(fields) != 3 or fields[0] != HOST or fields[1] not in ("ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa"):
             raise Failure(40)
     keypath, known = private / "deploy.key", private / "known_hosts"
-    private_file(keypath, key.encode())
+    private_file(keypath, (key.rstrip() + "\n").encode())
     private_file(known, (hosts.strip() + "\n").encode())
     return ["ssh", "-F", "/dev/null", "-T", "-i", str(keypath), "-o", "IdentitiesOnly=yes",
             "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o",
@@ -203,9 +203,9 @@ def remote(ssh, child, log, request, payload=None):
                 log.seek(max(log_start, end - 128 * 1024))
                 diagnostic = log.read().lower()
                 log.seek(0, os.SEEK_END)
-                for pattern, category in ((b"host key verification failed", "host-pin"),
+                for pattern, category in ((b"error in libcrypto", "key-format"),
+                                          (b"host key verification failed", "host-pin"),
                                           (b"permission denied", "authentication"),
-                                          (b"error in libcrypto", "key-format"),
                                           (b"connection timed out", "connection-timeout"),
                                           (b"connection refused", "connection-refused"),
                                           (b"network is unreachable", "network-unreachable")):
