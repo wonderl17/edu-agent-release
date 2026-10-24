@@ -28,6 +28,8 @@ USER = "teaching-production-ci"
 SITE = "https://shukezhinao.321weiqi.com"
 PROTOCOL = "teaching-production-ci-v1"
 TRANSFER_BUCKET = "teaching-production-releases-1331158445"
+INITIAL_SOURCE_SHA = "c59e7360dfd52cedbfc625a9a942ba67d64c320b"
+INITIAL_VERSION = "0.0.125"
 SHA = re.compile(r"[0-9a-f]{40}")
 VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
@@ -128,6 +130,21 @@ def should_deploy(operation, version, target, baseline, source_sha=None):
     threshold = max(version_tuple(baseline), version_tuple(target["version"]),
                     version_tuple(target.get("lastAttemptedVersion") or target["version"]))
     return operation in ("deploy", "resume") or (operation == "automatic" and current > threshold)
+
+
+def initial_activation(operation, requested, target):
+    """Only a root-issued one-shot gate permits manual initial original-package resume."""
+    return (operation == "resume" and requested == INITIAL_SOURCE_SHA and
+            target.get("status") == "verified" and target.get("configValid") is True and
+            target.get("bootstrapReady") is True and target.get("healthy") is False and
+            target.get("phase") == "bootstrap" and "currentSourceSha" in target and target["currentSourceSha"] is None and
+            target.get("version") == INITIAL_VERSION and target.get("baselineSourceSha") == requested and
+            target.get("initialActivationReady") is True and
+            isinstance(target.get("initialGateId"), str) and
+            re.fullmatch(r"[0-9a-f]{32}", target["initialGateId"]) is not None and
+            type(target.get("initialBundleBytes")) is int and 0 < target["initialBundleBytes"] <= 5 * 1024**3 and
+            isinstance(target.get("initialBundleSha256"), str) and
+            re.fullmatch(r"[0-9a-f]{64}", target["initialBundleSha256"]) is not None)
 
 
 def release_request(operation, sha, version, target):
@@ -422,10 +439,11 @@ def execute(env):
                 try:
                     status("Tencent Production: checking target.")
                     target = remote(ssh, child, log, {"action": "verify", "sourceSha": sha, "version": version})
+                    initial = initial_activation(operation, requested, target)
                     bootstrap = (target.get("bootstrapReady") is True and target.get("healthy") is False and
                                  target.get("phase") == "bootstrap" and target.get("currentSourceSha") is None)
                     if (target.get("status") != "verified" or target.get("configValid") is not True or
-                            (target.get("healthy") is not True and not (operation == "stage" and bootstrap))):
+                            (target.get("healthy") is not True and not (operation == "stage" and bootstrap) and not initial)):
                         raise Failure(44)
                     status("Tencent Production: checking trusted private source.")
                     token = installation_token(SOURCE, permission="read")
@@ -438,11 +456,16 @@ def execute(env):
                     if operation == "verify":
                         status("Tencent Production: verification complete; no deployment.")
                         return
-                    if operation != "stage" and not should_deploy(operation, version, target, env.get("TENCENT_PRODUCTION_BASELINE_VERSION", "0.0.125"), sha):
+                    if initial and (sha != INITIAL_SOURCE_SHA or version != INITIAL_VERSION):
+                        raise Failure(41)
+                    if operation != "stage" and not initial and not should_deploy(operation, version, target, env.get("TENCENT_PRODUCTION_BASELINE_VERSION", "0.0.125"), sha):
                         status("Tencent Production: no release required.")
                         return
-                    base = release_request(operation, sha, version, target)
-                    if operation != "stage":
+                    base = {"sourceSha": sha, "version": version, "initialGateId": target["initialGateId"]} if initial else release_request(operation, sha, version, target)
+                    # The initial target has no current Web to record against.
+                    # GitHub still records release-cloud, while the root-issued
+                    # gate owns its irreversible attempt_started/consumed state.
+                    if operation != "stage" and not initial:
                         result = remote(ssh, child, log, dict(base, action="record-attempt"))
                         if result.get("status") != "attempt_recorded":
                             raise Failure(44)
@@ -464,6 +487,9 @@ def execute(env):
                                 not re.fullmatch(r"[0-9a-f]{64}", ticket.get("bundleSha256", ""))):
                             raise Failure(47)
                         metadata = {"bytes": ticket["bundleBytes"], "sha256": ticket["bundleSha256"]}
+                        if initial and (metadata["bytes"] != target["initialBundleBytes"] or
+                                        metadata["sha256"] != target["initialBundleSha256"]):
+                            raise Failure(47)
                         identity = ticket["transferTicket"]
                     else:
                         bundle = build_bundle(source, sha, version, private, child, log)
@@ -480,6 +506,10 @@ def execute(env):
                                                         transferTicket=identity))
                     if (result.get("status") != ("staged" if operation == "stage" else "deployed") or
                             result.get("version") != version or result.get("sourceSha") != sha):
+                        raise Failure(44)
+                    if initial and (result.get("initialActivation") is not True or
+                                    result.get("gateId") != target["initialGateId"] or
+                                    result.get("verification", {}).get("healthy") is not True):
                         raise Failure(44)
                     if operation == "stage" and (result.get("transferTicket") != identity or
                             result.get("bundleBytes") != metadata["bytes"] or
