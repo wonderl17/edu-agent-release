@@ -149,12 +149,18 @@ def queue_release(repository: str, sha: str, operation: str, version: str, envir
         deployment_id = deployment["id"]
         if not isinstance(deployment_id, int) or deployment_id <= 0:
             raise ValueError()
-        api(token, "POST", f"/repos/{public_repository}/actions/workflows/release.yml/dispatches", {
-            "ref": "main",
-            "inputs": {
-                "source_repository": repository, "source_sha": sha,
-                "operation": operation, "target": "all", "confirm_release": "yes",
-            },
+        if operation == "cloud":
+            # Cloud has one canonical source and one fixed Tencent destination.
+            if repository != "shukezhinao/edu-agent":
+                raise ValueError()
+            workflow = "tencent-production.yml"
+            inputs = {"source_sha": sha, "operation": "deploy", "confirm_release": "yes"}
+        else:
+            workflow = "release.yml"
+            inputs = {"source_repository": repository, "source_sha": sha,
+                      "operation": operation, "target": "all", "confirm_release": "yes"}
+        api(token, "POST", f"/repos/{public_repository}/actions/workflows/{workflow}/dispatches", {
+            "ref": "main", "inputs": inputs,
         })
     except Exception:
         if deployment_id is not None:
@@ -176,6 +182,10 @@ def poll(config: Any, environment: dict[str, str], api: Callable, token_for_repo
         repository = source["repository"]
         sha, versions = source_versions(repository, api, token_for_repository)
         for operation in OPERATIONS:
+            # Preparation may enable manual staging before cutover. Cloud polling
+            # stays closed independently, without disabling Desktop publication.
+            if operation == "cloud" and environment.get("TENCENT_PRODUCTION_AUTOMATIC_ENABLED") != "true":
+                continue
             cursor = attempted_version(
                 repository, operation, source["baseline"][operation],
                 environment["PUBLIC_REPOSITORY"], environment["PUBLIC_GH_TOKEN"], api,

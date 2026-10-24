@@ -26,6 +26,7 @@ jobs:
           persist-credentials: false
       - name: Check canonical source versions
         env:
+          TENCENT_PRODUCTION_AUTOMATIC_ENABLED: ${{ vars.TENCENT_PRODUCTION_AUTOMATIC_ENABLED }}
           PUBLIC_GH_TOKEN: ${{ github.token }}
           PUBLIC_REPOSITORY: ${{ github.repository }}
           RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}

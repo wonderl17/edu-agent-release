@@ -3,12 +3,12 @@
     {
       "repository": "shukezhinao/edu-agent",
       "automatic": true,
-      "baseline": {"cloud": "0.0.121", "desktop": "0.0.121"}
+      "baseline": {"cloud": "0.0.125", "desktop": "0.0.121"}
     },
     {
       "repository": "wonderl17/edu-agent",
       "automatic": false,
-      "baseline": {"cloud": "0.0.121", "desktop": "0.0.121"}
+      "baseline": {"cloud": "0.0.125", "desktop": "0.0.121"}
     }
   ]
 }

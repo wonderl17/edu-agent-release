@@ -35,7 +35,7 @@ class PollTests(unittest.TestCase):
             {"repository": SOURCE, "automatic": True, "baseline": {"cloud": "0.0.121", "desktop": "0.0.121"}},
             {"repository": "wonderl17/edu-agent", "automatic": False, "baseline": {"cloud": "0.0.121", "desktop": "0.0.121"}},
         ]}
-        self.environment = {"PUBLIC_REPOSITORY": PUBLIC, "PUBLIC_GH_TOKEN": "public-fixture-token", "GITHUB_SHA": "b" * 40}
+        self.environment = {"PUBLIC_REPOSITORY": PUBLIC, "PUBLIC_GH_TOKEN": "public-fixture-token", "GITHUB_SHA": "b" * 40, "TENCENT_PRODUCTION_AUTOMATIC_ENABLED": "true"}
         self.versions = {"cloud": "0.0.122", "desktop": "0.0.123"}
         self.attempts = {"cloud": [], "desktop": []}
         self.calls = []
@@ -86,8 +86,32 @@ class PollTests(unittest.TestCase):
             self.assertEqual(attempt["required_contexts"], [])
             self.assertEqual(attempt["payload"], {"source_repository": SOURCE, "source_sha": SOURCE_SHA, "version": self.versions[operation], "operation": operation})
             inputs = mutations[index + 1][1]["inputs"]
-            self.assertEqual(inputs, {"source_repository": SOURCE, "source_sha": SOURCE_SHA, "operation": operation, "target": "all", "confirm_release": "yes"})
+            if operation == "cloud":
+                self.assertEqual(mutations[index + 1][0], f"/repos/{PUBLIC}/actions/workflows/tencent-production.yml/dispatches")
+                self.assertEqual(inputs, {"source_sha": SOURCE_SHA, "operation": "deploy", "confirm_release": "yes"})
+            else:
+                self.assertEqual(mutations[index + 1][0], f"/repos/{PUBLIC}/actions/workflows/release.yml/dispatches")
+                self.assertEqual(inputs, {"source_repository": SOURCE, "source_sha": SOURCE_SHA, "operation": operation, "target": "all", "confirm_release": "yes"})
         self.assertNotIn(SENTINEL, json.dumps(mutations))
+
+    def test_cloud_closed_independently_preserves_desktop_and_does_not_advance_cloud_cursor(self):
+        for enabled in (None, "false", "TRUE"):
+            self.environment["TENCENT_PRODUCTION_AUTOMATIC_ENABLED"] = enabled
+            self.calls.clear()
+            self.attempts = {"cloud": [], "desktop": []}
+            self.assertEqual(self.run_poll(), 1)
+            self.assertEqual(self.attempts["cloud"], [])
+            dispatches = [path for _token, method, path, _body in self.calls
+                          if method == "POST" and path.endswith("/dispatches")]
+            self.assertEqual(dispatches, [f"/repos/{PUBLIC}/actions/workflows/release.yml/dispatches"])
+
+    def test_production_baseline_does_not_republish_cutover_version_and_leaves_desktop_baseline(self):
+        configured = json.loads((Path(__file__).parent.parent / "config/repositories.json").read_text())
+        for source in configured["sources"]:
+            self.assertEqual(source["baseline"], {"cloud": "0.0.125", "desktop": "0.0.121"})
+        self.config = configured
+        self.versions = {"cloud": "0.0.125", "desktop": "0.0.121"}
+        self.assertEqual(self.run_poll(), 0)
 
     def test_repeated_poll_does_not_dispatch_attempted_versions(self):
         self.assertEqual(self.run_poll(), 2)
