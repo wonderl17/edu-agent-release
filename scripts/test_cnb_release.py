@@ -1,4 +1,5 @@
 import copy
+import ast
 import hashlib
 import importlib.util
 import io
@@ -126,6 +127,26 @@ class ControllerTests(unittest.TestCase):
 
 
 class ReceiverTests(unittest.TestCase):
+    def test_candidate_preflight_uses_runtime_policy_before_maintenance(self):
+        receiver=self.receiver;calls=[];base={'base':True};candidate={'candidate':True}
+        def reject(actual_base,actual_candidate):
+            self.assertEqual(actual_base,base);self.assertEqual(actual_candidate,candidate)
+            raise receiver.Refused('RELEASE_IMAGE_SCOPE_REFUSED')
+        ops=types.SimpleNamespace(compose_argv=lambda **kw:['docker','compose','-f','base.yaml'],
+                                  config=lambda **kw:base,validate_release=reject)
+        with patch.object(receiver,'run_dir',Path('/synthetic')),patch.object(receiver,'ops',ops), \
+             patch.object(receiver,'atomic',side_effect=lambda p,v:calls.append(('write',p))), \
+             patch.object(receiver,'command',side_effect=lambda argv:(calls.append(('command',argv)) or json.dumps(candidate).encode())):
+            with self.assertRaisesRegex(receiver.Refused,'RELEASE_IMAGE_SCOPE_REFUSED'):
+                receiver.candidate_preflight({},dict(images={kind:dict(tag=kind) for kind in ('api','worker')}),Path('/synthetic/web'))
+        self.assertEqual(calls[-1][1][-3:],['config','--format','json'])
+        # The actual deployment must perform this check before entering maintenance.
+        tree=ast.parse((Path(__file__).resolve().parents[1]/'server/tencent_receiver.py').read_text())
+        deploy=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='deploy')
+        checks=[n.lineno for n in ast.walk(deploy) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id=='candidate_preflight']
+        maintenance=[n.lineno for n in ast.walk(deploy) if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute) and n.func.attr=='maintenance']
+        self.assertEqual(len(checks),1);self.assertLess(checks[0],min(maintenance))
+
     def test_extension_loads_under_forced_ssh_python_isolation(self):
         root=Path(__file__).resolve().parents[1]
         script='''import importlib.util, pathlib

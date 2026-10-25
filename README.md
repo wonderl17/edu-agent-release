@@ -30,6 +30,8 @@ The controller checks the private repository's visibility, source tree, request 
 
 `production-release` needs `TENCENT_CNB_TOKEN`, scoped to this CNB repository: code read/write, build trigger read/write, history and basic-info read. Production's root-only `operations/release/registry-auth/config.json` contains a separate registry-package read-only token. Both initial tokens expire on 2027-01-23 and need rotation before expiry. Source, cache layers and build logs remain private. `server/tencent_receiver.py`, `scripts/tencent_registry.py` and `scripts/cnb_release.py` are the versioned receiver sources; install together with root ownership and mode 0600 after checksum/lock checks. No cloud resources or deployment permissions are given to CNB.
 
+Apply `server/production-ops-cnb.patch` to the existing root-owned `operations/startup/production-ops.py` under the same checksum/lock checks. It permits only this repository's exact API/Worker SHA-256 references alongside legacy local tags; arbitrary registries, mutable CNB tags and other Compose changes remain rejected. The receiver validates the complete candidate Compose configuration with that runtime policy before entering maintenance, stopping services or running migrations.
+
 COS is retained only for explicit legacy package recovery/compatibility. Its upload endpoint remains ordinary Beijing, with `accelerated_upload=false`; CNB failure never falls back to COS, local building or GCP. Desktop publishing is unchanged.
 
 ## Tencent validation

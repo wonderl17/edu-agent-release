@@ -1,0 +1,11 @@
+--- a/production-ops.py
++++ b/production-ops.py
+@@ -175,7 +175,7 @@
+     for name in ('api', *WORKERS):
+         image = candidate['services'][name]['image']
+         kind = 'api' if name == 'api' else 'worker'
+-        require(re.fullmatch(r'teaching-ai-production/' + kind + r':[a-zA-Z0-9_.-]+', image) is not None, 'RELEASE_IMAGE_SCOPE_REFUSED')
++        require(re.fullmatch(r'teaching-ai-production/' + kind + r':[a-zA-Z0-9_.-]+', image) is not None or re.fullmatch(r'docker\.cnb\.cool/shukezhinao/edu-agent-cloud-build/' + kind + r'@sha256:[0-9a-f]{64}', image) is not None, 'RELEASE_IMAGE_SCOPE_REFUSED')
+         candidate['services'][name]['image'] = base['services'][name]['image']
+     old = base['services']['web']['volumes']; new = candidate['services']['web']['volumes']
+     require(len(old) == len(new), 'RELEASE_WEB_MOUNT_COUNT_REFUSED')

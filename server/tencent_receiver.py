@@ -447,6 +447,10 @@ def drain(general):
   require(time.monotonic()<deadline,'ACTIVE_WORK_DRAIN_TIMEOUT');time.sleep(5)
 def candidate_override(h,m,web):
  return{'services':{'api':{'image':m['images']['api']['tag']},'worker-general':{'image':m['images']['worker']['tag']},'worker-ppt':{'image':m['images']['worker']['tag']},'web':{'volumes':[{'type':'bind','source':str(web),'target':'/usr/share/nginx/html','read_only':True,'bind':{'create_host_path':True}}]}}}
+def candidate_preflight(h,m,web):
+ path=run_dir/'candidate-compose.release.json';atomic(path,candidate_override(h,m,web))
+ candidate=decode(command(ops.compose_argv(include_release=False)+['-f',str(path),'config','--format','json']))
+ ops.validate_release(ops.config(include_release=False),candidate)
 def up_four():
  command(ops.compose_argv()+['up','-d','--no-deps','--no-build','--pull','never','--force-recreate','--wait','--wait-timeout','180','api','worker-general','worker-ppt','web'],timeout=300)
 def migration(h,m):
@@ -505,6 +509,7 @@ def deploy(h,stream):
   shutil.rmtree(web)
  else:
   target.mkdir(mode=0o700);shutil.move(str(web),target/'web-dist');atomic(target/'manifest.json',(run_dir/'manifest.json').read_bytes())
+ phase='candidate-preflight';candidate_preflight(h,m,target/'web-dist')
  previous=OVERRIDE.read_bytes()if OVERRIDE.exists()else None
  atomic(run_dir/'rollback-metadata.json',{'previousOverridePresent':previous is not None,'previousSourceSha':value['buildSha'],'snapshotId':snapshot_id})
  if previous is not None:atomic(run_dir/'previous-compose.release.yaml',previous)
