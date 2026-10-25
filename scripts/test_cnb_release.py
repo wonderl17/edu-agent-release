@@ -83,6 +83,18 @@ class ControllerTests(unittest.TestCase):
                 controller.build(None,'a'*40,'0.0.126',None,{},None,'SECRET',None,lambda *_:None)
             mirror.assert_not_called()
 
+    def test_green_build_without_completion_receipt_is_not_accepted(self):
+        def api(token,method,path,value=None):
+            if path=='':return dict(visibility_level='Private',path=contract.REPO)
+            if path.endswith('/start'):return dict(success=True,sn='build-123')
+            if '/status/' in path:return dict(status='success')
+            return []
+        with tempfile.TemporaryDirectory() as directory, patch.object(controller,'api',side_effect=api), \
+             patch.object(controller,'mirror',return_value=('c'*40,'b'*40)):
+            with self.assertRaisesRegex(ValueError,'receipt missing'):
+                controller.build(None,'a'*40,'0.0.126',Path(directory),{},None,'SECRET',None,lambda *_:None)
+            self.assertFalse((Path(directory)/'registry-manifest.json').exists())
+
     def test_snapshot_copies_exact_committed_tree_without_source_history(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);source=root/'source';source.mkdir();dest=root/'remote.git'

@@ -3,6 +3,7 @@ import datetime as dt
 import hashlib
 from pathlib import Path
 import shutil
+import subprocess
 import tarfile
 import time
 import uuid
@@ -79,7 +80,9 @@ def pull(c, h, stream, record):
     try:
         c.command(c.DOCKER + ['cp', container + ':/usr/share/nginx/html', str(copied)])
     finally:
-        c.command(c.DOCKER + ['rm', container])
+        # Cleanup remains possible after the SSH liveness monitor cancels work.
+        subprocess.run(c.DOCKER + ['rm', container], capture_output=True, timeout=30,
+                       env=c.ops.fixed_env(), check=False)
     try:
         c.web_permissions(copied)  # rejects links and special files before archiving
         paths = sorted(copied.rglob('*'))
