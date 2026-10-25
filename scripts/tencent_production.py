@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from release_auth import github_request, installation_token, stop_process
+from cnb_controller import build as build_cnb
 
 SOURCE = "shukezhinao/edu-agent"
 PUBLIC = "wonderl17/edu-agent-release"
@@ -151,7 +152,7 @@ def release_request(operation, sha, version, target):
     if version_tuple(version) < version_tuple(target["version"]):
         raise Failure(41)
     request = {"sourceSha": sha, "version": version}
-    if (operation in ("deploy", "resume") and version == target["version"] and
+    if (operation in ("stage", "deploy", "resume") and target.get("currentSourceSha") is not None and version == target["version"] and
             sha != target["currentSourceSha"]):
         request.update(expectedCurrentSourceSha=target["currentSourceSha"],
                        allowSameVersionSourceChange=True)
@@ -491,13 +492,30 @@ def execute(env):
                             raise Failure(47)
                         identity = ticket["transferTicket"]
                     else:
-                        bundle = build_bundle(source, sha, version, private, child, log)
-                        metadata = digest(bundle)
-                        status("Tencent Production: preparing private transfer.")
-                        ticket = remote(ssh, child, log, dict(base, action="prepare-transfer",
-                                                            bundleBytes=metadata["bytes"], bundleSha256=metadata["sha256"]))
-                        status("Tencent Production: uploading private release package.")
-                        identity = upload_bundle(ticket, bundle, sha, metadata)
+                        backend = env.get("TENCENT_BUILD_BACKEND") or "cnb"
+                        if backend == "cnb":
+                            bundle = build_cnb(source, sha, version, private, child, log,
+                                               env.get("TENCENT_CNB_TOKEN", ""), run, status)
+                            metadata = digest(bundle)
+                            ticket = remote(ssh, child, log, dict(base, action="prepare-registry",
+                                bundleBytes=metadata["bytes"], bundleSha256=metadata["sha256"],
+                                registryManifest=json.loads(bundle.read_text())))
+                            if (ticket.get("status") != "transfer_prepared" or ticket.get("transport") != "registry" or
+                                    not re.fullmatch(r"[0-9a-f]{32}", ticket.get("transferTicket", "")) or
+                                    ticket.get("bundleBytes") != metadata["bytes"] or
+                                    ticket.get("bundleSha256") != metadata["sha256"]):
+                                raise Failure(47)
+                            identity = ticket["transferTicket"]
+                        elif backend == "cos":
+                            bundle = build_bundle(source, sha, version, private, child, log)
+                            metadata = digest(bundle)
+                            status("Tencent Production: preparing private transfer.")
+                            ticket = remote(ssh, child, log, dict(base, action="prepare-transfer",
+                                                                bundleBytes=metadata["bytes"], bundleSha256=metadata["sha256"]))
+                            status("Tencent Production: uploading private release package.")
+                            identity = upload_bundle(ticket, bundle, sha, metadata)
+                        else:
+                            raise Failure(40)
                     status("Tencent Production: staging private package." if operation == "stage" else
                            "Tencent Production: applying and verifying release.")
                     result = remote(ssh, child, log, dict(base, action="stage" if operation == "stage" else "deploy",
@@ -514,6 +532,14 @@ def execute(env):
                             result.get("bundleBytes") != metadata["bytes"] or
                             result.get("bundleSha256") != metadata["sha256"]):
                         raise Failure(44)
+                    if "timings" in result:
+                        timings = result["timings"]
+                        for category in ("buildSeconds", "pullSeconds"):
+                            values = timings.get(category, {})
+                            if all(type(values.get(kind)) in (int, float) and 0 <= values[kind] <= 10800
+                                   for kind in ("api", "worker", "web")):
+                                status("Tencent Production: " + category + " " + ", ".join(
+                                    kind + "=" + str(round(values[kind], 1)) for kind in ("api", "worker", "web")))
                     deployed = True
                     try:
                         github_request(env["PUBLIC_GH_TOKEN"], "POST", f"/repos/{PUBLIC}/deployments/{deployment_id}/statuses", {

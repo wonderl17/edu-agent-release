@@ -1,0 +1,18 @@
+# The controller mirrors only a validated canonical source tree under source/.
+# No push, schedule, PR, workspace, or production credentials in this project.
+main:
+  api_trigger_tencent:
+    - name: Tencent immutable images
+      runner:
+        cpus: 8
+        tags: cnb:arch:amd64
+      docker:
+        image: docker:28-cli
+      services:
+        - docker
+      stages:
+        - name: Prepare Python and Git
+          script: apk add --no-cache python3 git
+        - name: Build, verify and publish immutable images
+          timeout: 90m
+          script: python3 .release-builder/build.py

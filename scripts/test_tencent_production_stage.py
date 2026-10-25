@@ -21,6 +21,7 @@ class ProductionStageTests(unittest.TestCase):
         env = {
             "RELEASES_ENABLED": "true", "PUBLIC_REPOSITORY": target.PUBLIC, "GITHUB_REF": "refs/heads/main", "GITHUB_SHA": "a" * 40,
             "TENCENT_OPERATION": operation, "TENCENT_SOURCE_SHA": self.SOURCE,
+            "TENCENT_BUILD_BACKEND": "cos",  # Explicit legacy compatibility fixture.
             "TENCENT_CONFIRM_RELEASE": "yes", "TENCENT_PRODUCTION_ENABLED": "true",
             "TENCENT_PRODUCTION_DEPLOY_SSH_KEY": "-----BEGIN OPENSSH PRIVATE KEY-----\n" + self.SENTINEL,
             "TENCENT_PRODUCTION_SSH_KNOWN_HOSTS": target.HOST + " ssh-ed25519 SYNTHETIC",
