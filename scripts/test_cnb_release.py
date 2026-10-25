@@ -180,5 +180,42 @@ assert context.OPS == receiver.OPS
         with self.assertRaisesRegex(self.receiver.Refused,'ACTIVE_PRODUCTION'):
             registry.prepare(c,self.header())
 
+    def test_containerd_manifest_id_requires_local_config_content_chain(self):
+        h=self.header()
+        labels={'org.opencontainers.image.revision':h['sourceSha'],'org.opencontainers.image.version':h['version']}
+        config=contract.canonical(dict(os='linux',architecture='amd64',config=dict(Labels=labels),rootfs=dict(diff_ids=['layer'])))
+        config_id='sha256:'+hashlib.sha256(config).hexdigest()
+        manifest=contract.canonical(dict(config=dict(digest=config_id)))
+        manifest_id='sha256:'+hashlib.sha256(manifest).hexdigest()
+        item=dict(ref=contract.REGISTRY+'/api@'+manifest_id,id=config_id)
+        image=dict(Id=manifest_id,RepoDigests=[item['ref']],Os='linux',Architecture='amd64',
+                   Config=dict(Labels=labels),RootFS=dict(Layers=['layer']),
+                   Descriptor=dict(digest=manifest_id,mediaType='application/vnd.oci.image.manifest.v1+json'))
+        blobs={manifest_id:manifest,config_id:config}
+        c=types.SimpleNamespace(require=self.receiver.require,decode=json.loads,
+                                command=lambda args,**kw:blobs[args[-1]])
+        proof=registry.image_identity(c,item,image,h)
+        self.assertEqual(proof['targetId'],manifest_id)
+        self.assertEqual(proof['sourceId'],config_id)
+        for key in (manifest_id,config_id):
+            original=blobs[key];blobs[key]=original+b' '
+            with self.assertRaisesRegex(self.receiver.Refused,'CONTENT_MISMATCH'):
+                registry.image_identity(c,item,image,h)
+            blobs[key]=original
+        image['RootFS']['Layers']=['wrong']
+        with self.assertRaisesRegex(self.receiver.Refused,'CONFIG_IDENTITY_MISMATCH'):
+            registry.image_identity(c,item,image,h)
+
+    def test_classic_config_id_still_checks_registry_platform_and_source(self):
+        h=self.header();item=h['registryManifest']['images']['api']
+        image=dict(Id=item['id'],RepoDigests=[item['ref']],Os='linux',Architecture='amd64',
+                   Config=dict(Labels={'org.opencontainers.image.revision':h['sourceSha'],
+                                       'org.opencontainers.image.version':h['version']}))
+        c=types.SimpleNamespace(require=self.receiver.require)
+        registry.image_identity(c,item,image,h)
+        image['Architecture']='arm64'
+        with self.assertRaisesRegex(self.receiver.Refused,'IDENTITY_MISMATCH'):
+            registry.image_identity(c,item,image,h)
+
 
 if __name__=='__main__':unittest.main()

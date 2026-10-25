@@ -49,6 +49,39 @@ def ticket(c, h):
     return record if record.get('transport') == 'registry' else None
 
 
+def image_identity(c, item, image, h):
+    labels = image.get('Config', {}).get('Labels', {})
+    c.require(item['ref'] in image.get('RepoDigests', []) and
+              image.get('Os') == 'linux' and image.get('Architecture') == 'amd64' and
+              labels.get('org.opencontainers.image.revision') == h['sourceSha'] and
+              labels.get('org.opencontainers.image.version') == h['version'], 'REGISTRY_IMAGE_IDENTITY_MISMATCH')
+    comparison = 'registry-digest-config-platform-revision'
+    if image.get('Id') != item['id']:
+        # Docker's containerd image store exposes the manifest digest as Id.
+        # Verify the local content chain, including the actual config bytes.
+        digest = item['ref'].split('@')[1]
+        descriptor = image.get('Descriptor', {})
+        c.require(image.get('Id') == digest and descriptor.get('digest') == digest and
+                  descriptor.get('mediaType') in ('application/vnd.oci.image.manifest.v1+json',
+                    'application/vnd.docker.distribution.manifest.v2+json'), 'REGISTRY_IMAGE_IDENTITY_MISMATCH')
+        ctr = ['/usr/bin/ctr', '--address', '/run/containerd/containerd.sock', '--namespace', 'moby', 'content', 'get']
+        raw = c.command(ctr + [digest], timeout=30)
+        c.require(len(raw) <= 1024**2 and 'sha256:' + hashlib.sha256(raw).hexdigest() == digest,
+                  'REGISTRY_MANIFEST_CONTENT_MISMATCH')
+        manifest = c.decode(raw)
+        c.require(manifest.get('config', {}).get('digest') == item['id'], 'REGISTRY_CONFIG_DIGEST_MISMATCH')
+        raw = c.command(ctr + [item['id']], timeout=30)
+        c.require(len(raw) <= 1024**2 and 'sha256:' + hashlib.sha256(raw).hexdigest() == item['id'],
+                  'REGISTRY_CONFIG_CONTENT_MISMATCH')
+        config = c.decode(raw)
+        c.require(config.get('os') == 'linux' and config.get('architecture') == 'amd64' and
+                  config.get('config', {}).get('Labels') == labels and
+                  config.get('rootfs', {}).get('diff_ids') == image.get('RootFS', {}).get('Layers'),
+                  'REGISTRY_CONFIG_IDENTITY_MISMATCH')
+        comparison = 'registry-local-manifest-config-chain-platform-revision'
+    return dict(sourceId=item['id'], targetId=image['Id'], registryDigestVerified=True, comparison=comparison)
+
+
 def pull(c, h, stream, record):
     raw = validate(c, record.get('registryManifest'), h)
     c.start_liveness(stream)
@@ -65,13 +98,7 @@ def pull(c, h, stream, record):
         start = time.monotonic()
         c.command(docker + ['pull', '--platform', 'linux/amd64', item['ref']], timeout=1800)
         image = c.decode(c.command(c.DOCKER + ['image', 'inspect', item['ref']]))[0]
-        c.require(item['ref'] in image.get('RepoDigests', []) and image.get('Id') == item['id'] and
-                  image.get('Os') == 'linux' and image.get('Architecture') == 'amd64' and
-                  image.get('Config', {}).get('Labels', {}).get('org.opencontainers.image.revision') == h['sourceSha'] and
-                  image.get('Config', {}).get('Labels', {}).get('org.opencontainers.image.version') == h['version'],
-                  'REGISTRY_IMAGE_IDENTITY_MISMATCH')
-        proofs[kind] = dict(sourceId=item['id'], targetId=image['Id'], registryDigestVerified=True,
-                            comparison='registry-digest-config-platform-revision')
+        proofs[kind] = image_identity(c, item, image, h)
         timings[kind] = round(time.monotonic() - start, 3)
     # docker create/cp never executes candidate code or contacts application data.
     container = c.command(c.DOCKER + ['create', manifest['images']['web']['ref']]).decode().strip()
