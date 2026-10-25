@@ -16,6 +16,7 @@ import time
 from release_auth import REPOSITORIES, github_request, installation_token, stop_process
 from mirror_installers import mirror_installers
 from desktop_checkpoints import CheckpointFile, FILE_ENV, report_checkpoints, without_checkpoint_environment
+from release_usage import not_used, report as report_usage
 
 MODES = frozenset(("cloud", "desktop", "resume", "verify", "migration-bootstrap"))
 SOURCE_PROJECT = "project-cd874991-605d-4143-a62"
@@ -184,6 +185,7 @@ def main():
     public_token = os.environ.get("PUBLIC_GH_TOKEN", "")
     public_repository = os.environ.get("PUBLIC_REPOSITORY", "wonderl17/edu-agent-release")
     result = 1
+    version = None
     try:
         operation = os.environ.get("RELEASE_OPERATION", "verify")
         repository = os.environ.get("SOURCE_REPOSITORY", "")
@@ -286,6 +288,9 @@ def main():
         print("Release controller failed; private diagnostics were withheld.", flush=True)
         return 1
     finally:
+        if operation in ("desktop", "resume"):
+            report_usage(not_used(), os.environ, operation, version,
+                         "cancelled" if was_cancelled else "success" if result == 0 else "failed")
         if source_owned:
             shutil.rmtree(source, ignore_errors=True)
         # Cancellation stops publication immediately; do not wait on network

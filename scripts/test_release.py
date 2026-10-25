@@ -74,7 +74,7 @@ class ControllerTests(unittest.TestCase):
     def test_controller_passes_refresh_helper_and_records_success_without_public_token(self):
         code, output, token = self.invoke(RELEASE_OPERATION="desktop")
         self.assertEqual(code, 0)
-        self.assertEqual(output, "Release controller stage: auth.\nRelease controller stage: source.\nRelease controller stage: private-execution.\nPrivate stage exit code: 0.\nRelease controller stage: public-installers.\nRelease controller complete.\n")
+        self.assertEqual(output, "Release controller stage: auth.\nRelease controller stage: source.\nRelease controller stage: private-execution.\nPrivate stage exit code: 0.\nRelease controller stage: public-installers.\nRelease controller complete.\nCNB release usage: basis=not-used; core_hours=0.0000.\n")
         self.assertEqual(token.call_count, 2)
         self.assertTrue(all(call.args == (SOURCE, "read") for call in token.call_args_list))
         child = self.children[0][1]

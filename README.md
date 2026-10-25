@@ -40,6 +40,12 @@ COS is retained only for explicit legacy package recovery/compatibility. Its upl
 
 The `teaching-validation` stack is stopped and retained. Its workflow has no schedule, a fixed false job guard, and is disabled in GitHub; both validation enable variables are false. Keep its historical implementation only for explicitly scoped recovery research. All normal Cloud releases and checks use **Tencent Production**. Never reactivate validation consumers alongside Production or run the old COS/backup deployment path as a fallback.
 
+## Per-release CNB CPU usage
+
+Every Tencent Production run writes a `CNB 发布额度` Actions job summary and a bounded `CNB release usage:` log line, including failures and cancellation when cleanup can run. The controller sums the CNB status API's `metricCoreHours` across all terminal pipelines; `metricDuration` is billing time in milliseconds, not controller elapsed/queue/deployment time. If core-hours are absent but billing duration and CPU labels are available, the result is explicitly estimated. Missing, partial or invalid metrics are pending, never zero. Accounting errors cannot alter the release result. After cancellation, stopping the build comes first; at most one 10-second read-only refresh reconciles its metrics. A hard-killed job or uncertain trigger can require later reconciliation.
+
+The private CNB build title includes the public GitHub run ID and attempt, so the same attempt can be located later without exposing private build IDs in public logs. Each rebuild is a separate charge; `stage` owns the build usage and original-package `resume` adds zero CNB build usage. Desktop uses GitHub runners and reports zero CNB usage. The 160-core-hour percentage is a community-plan comparison, not the organization's remaining monthly balance or an invoice; object/Git storage are outside this CPU metric. No organization billing permission or new secret is required. See the [official CNB API schema](https://api.cnb.cool/swagger.json) and [pricing rules](https://docs.cnb.cool/zh/saas/pricing.html).
+
 ## Privacy and credentials
 
 - A dedicated GitHub App is installed only on the two private source repositories. Read tokens fetch source; write tokens are issued only for private GitHub Release operations and expire automatically.

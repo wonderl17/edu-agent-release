@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 
 from release_auth import github_request, installation_token, stop_process
 from cnb_controller import build as build_cnb, verify_access as verify_cnb_access
+from release_usage import not_used, report as report_usage
 
 SOURCE = "shukezhinao/edu-agent"
 PUBLIC = "wonderl17/edu-agent-release"
@@ -424,6 +425,7 @@ def execute(env):
     token = None
     deployment_id = None
     deployed = False
+    usage, report_version, outcome = not_used(), None, "failed"
     previous = os.umask(0o077)
     try:
         runner = Path(env["RUNNER_TEMP"]).resolve(strict=True)
@@ -453,16 +455,19 @@ def execute(env):
                     clone_source(sha, token, source, child, log)
                     version = json.loads((source / "package.json").read_text())["version"]
                     version_tuple(version)
+                    report_version = version
                     if operation == "verify":
                         if (env.get("TENCENT_BUILD_BACKEND") or "cnb") == "cnb":
                             status("Tencent Production: checking private CNB access.")
                             verify_cnb_access(env.get("TENCENT_CNB_TOKEN", ""))
                         status("Tencent Production: verification complete; no deployment.")
+                        outcome = "success"
                         return
                     if initial and (sha != INITIAL_SOURCE_SHA or version != INITIAL_VERSION):
                         raise Failure(41)
                     if operation != "stage" and not initial and not should_deploy(operation, version, target, env.get("TENCENT_PRODUCTION_BASELINE_VERSION", "0.0.125"), sha):
                         status("Tencent Production: no release required.")
+                        outcome = "success"
                         return
                     base = {"sourceSha": sha, "version": version, "initialGateId": target["initialGateId"]} if initial else release_request(operation, sha, version, target)
                     # The initial target has no current Web to record against.
@@ -498,7 +503,8 @@ def execute(env):
                         backend = env.get("TENCENT_BUILD_BACKEND") or "cnb"
                         if backend == "cnb":
                             bundle = build_cnb(source, sha, version, private, child, log,
-                                               env.get("TENCENT_CNB_TOKEN", ""), run, status)
+                                               env.get("TENCENT_CNB_TOKEN", ""), run, status, usage=usage,
+                                               run_id=env.get("GITHUB_RUN_ID"), run_attempt=env.get("GITHUB_RUN_ATTEMPT"))
                             metadata = digest(bundle)
                             ticket = remote(ssh, child, log, dict(base, action="prepare-registry",
                                 bundleBytes=metadata["bytes"], bundleSha256=metadata["sha256"],
@@ -553,9 +559,12 @@ def execute(env):
                     except Exception:
                         status("Tencent Production: target verified; deployment metadata update failed.")
                         raise Failure(46)
+                    outcome = "success"
                     status("Tencent Production: staging complete; no services changed." if operation == "stage" else
                            "Tencent Production: deployment and verification complete.")
                 except BaseException as error:
+                    if isinstance(error, (SystemExit, KeyboardInterrupt)):
+                        outcome = "cancelled"
                     if operation != "verify" and not isinstance(error, (SystemExit, KeyboardInterrupt)):
                         try:
                             log.flush()
@@ -570,6 +579,7 @@ def execute(env):
                             pass
                     raise
     finally:
+        report_usage(usage, env, operation, report_version, outcome, status)
         if deployment_id and not deployed:
             try:
                 github_request(env["PUBLIC_GH_TOKEN"], "POST", f"/repos/{PUBLIC}/deployments/{deployment_id}/statuses", {

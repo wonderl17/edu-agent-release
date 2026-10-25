@@ -10,14 +10,15 @@ import uuid
 from urllib.request import Request, urlopen
 
 from cnb_release import REPO, SOURCE, SHA, canonical, validate_manifest
+from release_usage import from_status, pending
 
 
-def api(token, method, path, value=None):
+def api(token, method, path, value=None, *, timeout=45):
     request = Request("https://api.cnb.cool/" + REPO + path, method=method,
                       data=canonical(value) if value is not None else None,
                       headers={"Authorization": "Bearer " + token,
                                "Accept": "application/vnd.cnb.api+json", "Content-Type": "application/json"})
-    with urlopen(request, timeout=45) as response:
+    with urlopen(request, timeout=timeout) as response:
         raw = response.read(1024 * 1024 + 1)
         if len(raw) > 1024 * 1024:
             raise ValueError("CNB response limit")
@@ -78,7 +79,7 @@ def verify_access(token):
     api(token, "GET", "/-/build/logs?page=1&page_size=1")
 
 
-def build(source, sha, version, private, child, log, token, run, status):
+def build(source, sha, version, private, child, log, token, run, status, usage=None, run_id=None, run_attempt=None):
     if not SHA.fullmatch(sha):
         raise ValueError("CNB configuration")
     # Never send source to a public/mistaken destination.
@@ -87,15 +88,24 @@ def build(source, sha, version, private, child, log, token, run, status):
     status("Tencent Production: synchronizing validated source to private CNB.")
     snapshot, source_tree = mirror(source, sha, version, private, child, log, token, run)
     request_id = uuid.uuid4().hex
+    if usage is not None:
+        # A lost trigger response may still have started a billable build.
+        usage.update(pending())
+    title = "Tencent Production " + version
+    if (isinstance(run_id, str) and re.fullmatch(r"[1-9][0-9]{0,19}", run_id) and
+            isinstance(run_attempt, str) and re.fullmatch(r"[1-9][0-9]{0,5}", run_attempt)):
+        # Allows later accounting reconciliation without exposing private CNB IDs.
+        title += " [GitHub " + run_id + "/" + run_attempt + "]"
     result = api(token, "POST", "/-/build/start", {
         "branch": "main", "sha": snapshot, "event": "api_trigger_tencent",
-        "env": {"RELEASE_REQUEST_ID": request_id}, "title": "Tencent Production " + version})
+        "env": {"RELEASE_REQUEST_ID": request_id}, "title": title})
     sn = result.get("sn", "")
     if result.get("success") is not True or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sn):
         raise ValueError("CNB trigger failed")
     (private / "cnb-build.json").write_bytes(canonical(dict(snapshotSha=snapshot, requestId=request_id, sn=sn)))
     complete = False
     terminal = False
+    state = None
     try:
         status("Tencent Production: CNB building and pushing cached image layers.")
         deadline = time.monotonic() + 6000
@@ -129,3 +139,15 @@ def build(source, sha, version, private, child, log, token, run, status):
                 api(token, "POST", "/-/build/stop/" + sn)
             except Exception:
                 status("Tencent Production: CNB cancellation could not be confirmed.")
+        if usage is not None:
+            try:
+                measured = from_status(state)
+                if measured["basis"] in ("pending", "estimated"):
+                    # One short, read-only reconciliation after failure/stop or
+                    # delayed accounting. Never delay cancellation with polling.
+                    refreshed = from_status(api(token, "GET", "/-/build/status/" + sn, timeout=10))
+                    if refreshed["basis"] != "pending":
+                        measured = refreshed
+                usage.update(measured)
+            except Exception:
+                usage.update(from_status(state))
