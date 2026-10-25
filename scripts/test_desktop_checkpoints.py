@@ -50,6 +50,10 @@ class CheckpointTests(unittest.TestCase):
         self.assertIsNone(checkpoints.validated_checkpoint_path(str(self.channel.path), self.root))
         self.assertEqual(self.report(), "")
 
+    def test_only_fixed_platforms_and_bounded_durations_are_public(self):
+        self.channel.path.write_text("D_ELECTRON success mac-arm64 12345\nD_ELECTRON success PRIVATE_VALUE 5\nD_VPK_PACK success all -1\nD_VPK_PACK success all 99999999\nD_VPK_PACK success all 1.1\n")
+        self.assertEqual(self.report(), "Desktop checkpoint: D_ELECTRON success.\nDesktop timing: D_ELECTRON mac-arm64 12345 ms.\n")
+
     def test_symlinks_foreign_paths_and_oversized_channels_are_rejected(self):
         target = self.root / "secret"
         target.write_text(SENTINEL)
@@ -188,8 +192,9 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertLessEqual(self.channel.path.stat().st_size, checkpoints.MAX_BYTES)
         output = self.report()
-        self.assertEqual(len(output.splitlines()), checkpoints.MAX_RECORDS)
-        self.assertTrue(output.endswith("Desktop checkpoint: D_ENTRY failure.\n"))
+        self.assertLessEqual(len(output.splitlines()), checkpoints.MAX_RECORDS * 2)
+        self.assertIn("Desktop checkpoint: D_ENTRY failure.\n", output)
+        self.assertRegex(output.splitlines()[-1], r"Desktop timing: D_ENTRY all [0-9]+ ms\.")
 
 
 if __name__ == "__main__":

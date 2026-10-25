@@ -1,6 +1,7 @@
 import contextlib
 from copy import deepcopy
 import hashlib
+import json
 import io
 import os
 from pathlib import Path
@@ -103,10 +104,10 @@ class MirrorTests(unittest.TestCase):
             self.assertEqual(environment["GH_TOKEN"], self.parameters["source_token"])
             self.assertEqual(command[command.index("--repo") + 1], SOURCE)
             patterns = [command[index + 1] for index, item in enumerate(command) if item == "--pattern"]
-            self.assertEqual(patterns, list(self.names))
+            self.assertTrue(patterns and set(patterns).issubset(self.names))
             downloads = Path(command[command.index("--dir") + 1])
-            for name, body in self.bodies.items():
-                (downloads / name).write_bytes(body)
+            for name in patterns:
+                (downloads / name).write_bytes(self.bodies[name])
             if self.download_change:
                 self.download_change(downloads)
         elif command[1:3] == ["release", "upload"]:
@@ -153,6 +154,45 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(self.destination["name"], "数科智脑 v" + VERSION)
         self.assertEqual(len(self.commands), 2)
         self.assert_clean()
+
+    def prepare_local(self):
+        directory = self.temporary.resolve() / "source/apps/desktop/release-velopack"
+        directory.mkdir(parents=True)
+        for name, body in self.bodies.items():
+            channel = name.removeprefix("ShukeZhinao-" + VERSION + "-").rsplit(".", 1)[0]
+            local_name = channel + "-Setup" + Path(name).suffix
+            (directory / local_name).write_bytes(body)
+            (directory / ("assets." + channel + ".json")).write_text(json.dumps([
+                {"RelativeFileName": local_name, "Type": "Installer"}]))
+        self.parameters["local_release_dir"] = directory
+        return directory
+
+    def test_matching_local_bytes_skip_all_private_installer_downloads(self):
+        self.prepare_local()
+        self.mirror()
+        self.assertEqual(len(self.commands), 1)
+        self.assertEqual(self.commands[0][0][1:3], ["release", "upload"])
+        self.assertFalse(self.destination["draft"])
+
+    def test_local_wrong_hash_falls_back_to_original_private_bytes(self):
+        directory = self.prepare_local()
+        for path in directory.glob("*Setup*"):
+            path.write_bytes(b"x" * path.stat().st_size)
+        self.mirror()
+        self.assertEqual(self.commands[0][0][1:3], ["release", "download"])
+        self.assertEqual(len(self.commands), 2)
+
+    def test_local_symlink_downloads_only_the_missing_platform(self):
+        directory = self.prepare_local()
+        installer = directory / "mac-arm64-Setup.pkg"
+        original = directory / "original.pkg"
+        installer.rename(original)
+        installer.symlink_to(original)
+        self.mirror()
+        command = self.commands[0][0]
+        patterns = [command[i + 1] for i, value in enumerate(command) if value == "--pattern"]
+        self.assertEqual(patterns, [self.names[0]])
+        self.assertEqual(len(self.commands), 2)
 
     def test_source_release_and_installer_metadata_fail_closed(self):
         changes = (

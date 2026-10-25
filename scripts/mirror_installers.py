@@ -1,6 +1,8 @@
 """Copy verified desktop installers without exposing private release content."""
 
 import hashlib
+import json
+import shutil
 import os
 from pathlib import Path
 import re
@@ -86,6 +88,38 @@ def _verify_file(file, expected):
         raise ValueError()
 
 
+def _local_installer(directory, temporary, name, output, expected):
+    """Reuse only bytes authenticated against the published private asset digest."""
+    if directory is None:
+        return False
+    try:
+        directory = Path(directory)
+        if not directory.is_relative_to(temporary) or directory.resolve(strict=True) != directory:
+            return False
+        channel = next(value for value in ("mac-arm64", "mac-x64", "win-x64") if name.endswith(value + (".exe" if value == "win-x64" else ".pkg")))
+        metadata = directory / ("assets." + channel + ".json")
+        info = metadata.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+            return False
+        entries = json.loads(metadata.read_text())
+        matches = [x["RelativeFileName"] for x in entries if x.get("Type") == "Installer"]
+        if len(matches) != 1 or re.fullmatch(r"[A-Za-z0-9._-]+", matches[0]) is None or channel not in matches[0]:
+            return False
+        candidate = directory / matches[0]
+        descriptor = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size != expected[0]:
+                return False
+            with output.open("xb") as target:
+                shutil.copyfileobj(source, target, 8 * 1024 * 1024)
+        _verify_file(output, expected)
+        return True
+    except Exception:
+        output.unlink(missing_ok=True)
+        return False
+
+
 def _destination_release(token, path, tag):
     release = github_request(token, "GET", path + "/tags/" + tag, allow_not_found=True)
     if release is not None:
@@ -107,7 +141,7 @@ def _destination_release(token, path, tag):
 
 
 def mirror_installers(*, source_repository, version, source_token, public_repository,
-                      public_sha, public_token, temporary):
+                      public_sha, public_token, temporary, local_release_dir=None):
     """Mirror only the three original installers; never rebuild or overwrite."""
     try:
         if (source_repository not in REPOSITORIES or public_repository != PUBLIC_REPOSITORY
@@ -141,9 +175,12 @@ def mirror_installers(*, source_repository, version, source_token, public_reposi
             downloads.mkdir(mode=0o700)
             arguments = ["release", "download", tag, "--repo", source_repository,
                          "--dir", str(downloads)]
-            for name in names:
-                arguments.extend(("--pattern", name))
-            _run_gh(arguments, source_token, directory)
+            missing_local = [name for name in names if not _local_installer(
+                local_release_dir, temporary, name, downloads / name, expected[name])]
+            if missing_local:
+                for name in missing_local:
+                    arguments.extend(("--pattern", name))
+                _run_gh(arguments, source_token, directory)
             if {file.name for file in downloads.iterdir()} != set(names):
                 raise ValueError()
             for name in names:

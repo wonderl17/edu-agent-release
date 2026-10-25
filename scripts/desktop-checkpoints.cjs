@@ -2,6 +2,7 @@
 
 // Trusted controller preload. Never serialize commands, arguments, environment,
 // child output, exceptions, paths or numeric exit codes into this channel.
+// Only bounded elapsed milliseconds and fixed platform labels may be added.
 const fs = require("node:fs");
 const path = require("node:path");
 const childProcess = require("node:child_process");
@@ -9,17 +10,17 @@ const { syncBuiltinESMExports } = require("node:module");
 const { errorMonitor } = require("node:events");
 
 const file = process.env.RELEASE_DESKTOP_CHECKPOINT_FILE;
-const maxBytes = 8192;
+const maxBytes = 16384;
 const stages = new Set([
   "D_ENTRY", "D_TOOLCHAIN", "D_DEPENDENCIES", "D_CHANGELOG", "D_NODE_CHECK",
   "D_VPK_SETUP", "D_WINDOWS_SETUP", "D_MAC_SIGN", "D_PACKAGE", "D_PREFLIGHT",
   "D_WEB_BUILD", "D_VITE", "D_SIDECAR", "D_ELECTRON", "D_LATEX", "D_PDF",
   "D_VPK_DOWNLOAD", "D_VPK_PACK", "D_VPK_DELTA", "D_VERIFY", "D_R2_PUBLISH",
-  "D_FINAL_PUBLISH", "D_RESUME", "D_TOKEN_REFRESH",
+  "D_FINAL_PUBLISH", "D_RESUME", "D_TOKEN_REFRESH", "D_CACHE_RESTORE", "D_CACHE_SAVE",
 ]);
 const states = new Set(["start", "success", "failure"]);
 
-function record(stage, state) {
+function record(stage, state, started = performance.now()) {
   if (!file || !stages.has(stage) || !states.has(state)) return;
   let descriptor;
   let locked = false;
@@ -30,7 +31,9 @@ function record(stage, state) {
     locked = true;
     descriptor = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     const metadata = fs.fstatSync(descriptor);
-    const line = `${stage} ${state}\n`;
+    const scope = ["mac-arm64", "mac-x64", "win-x64"].includes(process.env.DESKTOP_PACK_TARGET) ? process.env.DESKTOP_PACK_TARGET : "all";
+    const elapsed = state === "start" ? 0 : Math.min(10800000, Math.max(0, Math.round(performance.now() - started)));
+    const line = `${stage} ${state} ${scope} ${elapsed}\n`;
     if (metadata.isFile() && (metadata.mode & 0o777) === 0o600
         && metadata.uid === process.getuid()) {
       const next = Buffer.from(line);
@@ -58,6 +61,7 @@ function nodeStage(entry) {
   if (typeof entry !== "string") return null;
   switch (path.basename(entry)) {
     case "ci-release-desktop.mjs": return "D_ENTRY";
+    case "pack-desktop-release.mjs": return process.argv.includes("--prepared") ? "D_PACKAGE" : null;
     case "release-preflight.mjs": return "D_PREFLIGHT";
     case "vite.js": case "vite": return "D_VITE";
     case "stage-sidecar-runtime.cjs": return "D_SIDECAR";
@@ -84,6 +88,7 @@ function commandStage(command, args) {
     if (args[0] === "--filter" && args[1] === "@teaching-ai-agent/desktop" && args[2] === "build:sidecar") return "D_SIDECAR";
   }
   if (name === "node") {
+    if (path.basename(String(args[0])) === "desktop-build-cache.mjs") return args[1] === "restore" ? "D_CACHE_RESTORE" : "D_CACHE_SAVE";
     if (args[0] === "--input-type=module" && args[1] === "--eval") return "D_NODE_CHECK";
     if (path.basename(String(args[0])) === "resume-cos-release.mjs") return "D_RESUME";
   }
@@ -134,21 +139,22 @@ if (file) for (const method of ["spawn", "spawnSync"]) {
     const values = Array.isArray(args) ? args : [];
     const stage = commandStage(command, values);
     const actualOptions = inheritedOptions(command, sourceOptions);
-    record(stage, "start");
+    const started = performance.now();
+    record(stage, "start", started);
     try {
       const child = original.call(this, command, values, actualOptions);
       if (method === "spawnSync") {
-        record(stage, child.status === 0 && !child.error ? "success" : "failure");
+        record(stage, child.status === 0 && !child.error ? "success" : "failure", started);
       } else {
         let finished = false;
-        const finish = (state) => { if (!finished) { finished = true; record(stage, state); } };
+        const finish = (state) => { if (!finished) { finished = true; record(stage, state, started); } };
         // errorMonitor preserves unhandled-error behavior of the original API.
         child.once(errorMonitor, () => finish("failure"));
         child.once("close", (code) => finish(code === 0 ? "success" : "failure"));
       }
       return child;
     } catch (error) {
-      record(stage, "failure");
+      record(stage, "failure", started);
       throw error;
     }
   };
@@ -156,5 +162,6 @@ if (file) for (const method of ["spawn", "spawnSync"]) {
 syncBuiltinESMExports();
 
 const ownStage = nodeStage(process.argv[1]);
-record(ownStage, "start");
-process.once("exit", (code) => record(ownStage, code === 0 ? "success" : "failure"));
+const ownStarted = performance.now();
+record(ownStage, "start", ownStarted);
+process.once("exit", (code) => record(ownStage, code === 0 ? "success" : "failure", ownStarted));

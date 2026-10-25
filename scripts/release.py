@@ -270,7 +270,8 @@ def main():
             mirror_token = installation_token(repository, "read")
             mirror_installers(source_repository=repository, version=version, source_token=mirror_token,
                               public_repository=public_repository, public_sha=os.environ["GITHUB_SHA"],
-                              public_token=public_token, temporary=temporary)
+                              public_token=public_token, temporary=temporary,
+                              local_release_dir=source / "apps/desktop/release-velopack" if operation == "desktop" else None)
         if result:
             raise RuntimeError("Private stage failed")
         print("Release controller complete.", flush=True)

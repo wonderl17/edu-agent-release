@@ -101,6 +101,7 @@ jobs:
           CONFIRM_RELEASE: ${{ inputs.confirm_release }}
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          DESKTOP_PACK_CONCURRENCY: ${{ vars.DESKTOP_PACK_CONCURRENCY || '2' }}
           DESKTOP_UPDATE_BASE_URL: ${{ vars.DESKTOP_UPDATE_BASE_URL }}
           DESKTOP_UPDATE_BUCKET: ${{ vars.DESKTOP_UPDATE_BUCKET }}
           DESKTOP_UPDATE_S3_ENDPOINT: ${{ vars.DESKTOP_UPDATE_S3_ENDPOINT }}
@@ -135,3 +136,4 @@ jobs:
           find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'release-auth-*' -exec rm -rf -- {} +
           find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'private-desktop-release-*' -exec rm -rf -- {} +
           find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'installer-mirror-*' -exec rm -rf -- {} +
+          find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'desktop-pack-*' -exec rm -rf -- {} +

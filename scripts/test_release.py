@@ -155,6 +155,7 @@ class ControllerTests(unittest.TestCase):
                 "source_repository": SOURCE, "version": "0.0.123", "source_token": "private_fixture_token",
                 "public_repository": "wonderl17/edu-agent-release", "public_sha": "b" * 40,
                 "public_token": "public_fixture_token", "temporary": self.root.resolve(),
+                "local_release_dir": self.root.resolve() / "edu-agent-private-source/apps/desktop/release-velopack" if operation == "desktop" else None,
             }])
             self.assertNotIn("PUBLIC_GH_TOKEN", self.children[0][1])
 
