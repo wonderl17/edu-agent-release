@@ -262,16 +262,15 @@ def digest(path):
 
 
 def upload_bundle(ticket, bundle, sha, metadata):
-    """One short-lived private COS PUT; no cloud credential enters this job."""
+    """One regional private COS PUT; no acceleration or cloud key in this job."""
     identity = ticket.get("transferTicket")
     if (ticket.get("status") != "transfer_prepared" or not isinstance(identity, str) or
             not re.fullmatch(r"[0-9a-f]{32}", identity) or metadata["bytes"] > 5 * 1024**3):
         raise Failure(47)
     url = ticket.get("uploadUrl", "")
     parsed = urlsplit(url)
-    hosts = {TRANSFER_BUCKET + ".cos.accelerate.myqcloud.com",
-             TRANSFER_BUCKET + ".cos.ap-beijing.myqcloud.com"}
-    if (parsed.scheme != "https" or parsed.hostname not in hosts or parsed.port is not None or
+    host = TRANSFER_BUCKET + ".cos.ap-beijing.myqcloud.com"
+    if (parsed.scheme != "https" or parsed.hostname != host or parsed.port is not None or
             parsed.username or parsed.password or parsed.fragment or not parsed.query or
             parsed.path != f"/teaching-production/releases/{sha}/{identity}.tar"):
         raise Failure(47)
