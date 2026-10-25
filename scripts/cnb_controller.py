@@ -68,13 +68,21 @@ def mirror(source, sha, version, private, child, log, token, run):
     return snapshot, source_tree
 
 
-def build(source, sha, version, private, child, log, token, run, status):
-    if not token or not SHA.fullmatch(sha):
+def verify_access(token):
+    """Read-only credential/destination check; never sync source or start a job."""
+    if not token:
         raise ValueError("CNB configuration")
-    # Never send source to a public/mistaken destination.
     project = api(token, "GET", "")
     if project.get("visibility_level") != "Private" or project.get("path") != REPO:
         raise ValueError("CNB repository must be private")
+    api(token, "GET", "/-/build/logs?page=1&page_size=1")
+
+
+def build(source, sha, version, private, child, log, token, run, status):
+    if not SHA.fullmatch(sha):
+        raise ValueError("CNB configuration")
+    # Never send source to a public/mistaken destination.
+    verify_access(token)
     started = time.monotonic()
     status("Tencent Production: synchronizing validated source to private CNB.")
     snapshot, source_tree = mirror(source, sha, version, private, child, log, token, run)

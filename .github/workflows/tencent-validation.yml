@@ -2,8 +2,6 @@ name: Tencent validation
 run-name: Tencent validation · ${{ inputs.operation || 'automatic' }}
 
 on:
-  schedule:
-    - cron: '12,27,42,57 * * * *'
   workflow_dispatch:
     inputs:
       operation:
@@ -34,7 +32,8 @@ concurrency:
 
 jobs:
   validation:
-    if: github.ref == 'refs/heads/main'
+    # Retired validation stack: retained only as history, never a release target.
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     # Source deploy keys are prohibited by the private repository. This uses

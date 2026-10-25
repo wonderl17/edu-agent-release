@@ -89,6 +89,27 @@ class ProductionBoundaryTests(unittest.TestCase):
         with patch.object(target, "remote", side_effect=AssertionError("unexpected SSH")):
             target.execute(self.environment(TENCENT_OPERATION="automatic"))
 
+    def test_verify_checks_cnb_without_starting_a_build_or_recording_attempt(self):
+        def clone(sha, token, source, child, log):
+            (source / 'package.json').write_text('{"version":"0.0.126"}')
+        for unavailable in (False, True):
+            with self.subTest(unavailable=unavailable), tempfile.TemporaryDirectory() as directory:
+                env = self.environment(RUNNER_TEMP=directory, TENCENT_SOURCE_SHA='b'*40, TENCENT_CNB_TOKEN='CNB_SENTINEL')
+                with patch.object(target, 'ssh_configuration', return_value=[]), \
+                     patch.object(target, 'remote', return_value=dict(status='verified', configValid=True, healthy=True)) as remote, \
+                     patch.object(target, 'installation_token', return_value='APP_SENTINEL'), \
+                     patch.object(target, 'clone_source', side_effect=clone), \
+                     patch.object(target, 'verify_cnb_access', side_effect=ValueError('unavailable') if unavailable else None) as verify, \
+                     patch.object(target, 'build_cnb') as build, patch.object(target, 'github_request') as github:
+                    if unavailable:
+                        with self.assertRaises(ValueError): target.execute(env)
+                    else:
+                        target.execute(env)
+                verify.assert_called_once_with('CNB_SENTINEL')
+                build.assert_not_called()
+                self.assertEqual([c.args[3]['action'] for c in remote.call_args_list], ['verify'])
+                github.assert_called_once_with('APP_SENTINEL', 'DELETE', '/installation/token')
+
     def test_same_version_override_is_narrow_and_never_used_for_upgrades(self):
         current = {"version": "0.0.125", "currentSourceSha": "a" * 40}
         override = target.release_request("deploy", "b" * 40, "0.0.125", current)

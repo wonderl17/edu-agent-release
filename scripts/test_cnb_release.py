@@ -62,6 +62,20 @@ class ManifestTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_access_preflight_is_read_only_and_rejects_missing_or_wrong_credentials(self):
+        with patch.object(controller, 'api', return_value=dict(visibility_level='Private', path=contract.REPO)) as api:
+            controller.verify_access('SECRET')
+            self.assertEqual([(c.args[1], c.args[2]) for c in api.call_args_list],
+                             [('GET', ''), ('GET', '/-/build/logs?page=1&page_size=1')])
+        for project in (dict(visibility_level='Public', path=contract.REPO),
+                        dict(visibility_level='Private', path='wrong/repo')):
+            with patch.object(controller, 'api', return_value=project) as api:
+                with self.assertRaises(ValueError): controller.verify_access('SECRET')
+                self.assertEqual(api.call_count, 1)
+        with patch.object(controller, 'api') as api:
+            with self.assertRaises(ValueError): controller.verify_access('')
+            api.assert_not_called()
+
     def test_cancellation_stops_cnb_and_keeps_secrets_out_of_status(self):
         calls=[];messages=[]
         def api(token,method,path,value=None):

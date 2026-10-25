@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from release_auth import github_request, installation_token, stop_process
-from cnb_controller import build as build_cnb
+from cnb_controller import build as build_cnb, verify_access as verify_cnb_access
 
 SOURCE = "shukezhinao/edu-agent"
 PUBLIC = "wonderl17/edu-agent-release"
@@ -454,6 +454,9 @@ def execute(env):
                     version = json.loads((source / "package.json").read_text())["version"]
                     version_tuple(version)
                     if operation == "verify":
+                        if (env.get("TENCENT_BUILD_BACKEND") or "cnb") == "cnb":
+                            status("Tencent Production: checking private CNB access.")
+                            verify_cnb_access(env.get("TENCENT_CNB_TOKEN", ""))
                         status("Tencent Production: verification complete; no deployment.")
                         return
                     if initial and (sha != INITIAL_SOURCE_SHA or version != INITIAL_VERSION):

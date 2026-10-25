@@ -73,6 +73,12 @@ class PollTests(unittest.TestCase):
     def run_poll(self):
         return POLL.poll(self.config, self.environment, self.api, self.token)
 
+    def test_dry_run_checks_both_versions_without_dispatch_or_attempt_writes(self):
+        self.environment['RELEASE_POLL_DRY_RUN'] = 'true'
+        self.assertEqual(self.run_poll(), 2)
+        self.assertTrue(all(call[1] == 'GET' for call in self.calls))
+        self.assertEqual(self.attempts, {'cloud': [], 'desktop': []})
+
     def test_records_attempt_before_dispatch_for_both_components(self):
         self.assertEqual(self.run_poll(), 2)
         self.assertEqual(self.token_calls, [(SOURCE, "read")])
@@ -283,6 +289,17 @@ class SchedulerActivityTests(unittest.TestCase):
             poll.assert_called_once()
             self.assertEqual(maintain.call_count, 0 if failed else 1)
             self.assertNotIn(SENTINEL, stdout.getvalue() + stderr.getvalue())
+
+    def test_dry_run_main_does_not_write_scheduler_activity(self):
+        auth = types.SimpleNamespace(github_request=self.api, installation_token=lambda *_args, **_kwargs: 'fixture')
+        with patch.dict(sys.modules, {'release_auth': auth}), \
+             patch.dict(os.environ, dict(self.environment, RELEASE_POLL_DRY_RUN='true')), \
+             patch.object(Path, 'read_text', return_value='{}'), patch.object(POLL, 'poll', return_value=2), \
+             patch.object(POLL, 'maintain_scheduler_activity') as maintain, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(POLL.main(), 0)
+        maintain.assert_not_called()
+        self.assertIn('2 eligible release(s); no dispatch or writes', output.getvalue())
 
 
 if __name__ == "__main__":

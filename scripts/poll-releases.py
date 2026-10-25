@@ -192,7 +192,8 @@ def poll(config: Any, environment: dict[str, str], api: Callable, token_for_repo
             )
             if compare_versions(versions[operation], cursor) <= 0:
                 continue
-            queue_release(repository, sha, operation, versions[operation], environment, api)
+            if environment.get("RELEASE_POLL_DRY_RUN") != "true":
+                queue_release(repository, sha, operation, versions[operation], environment, api)
             count += 1
     return count
 
@@ -242,8 +243,11 @@ def main() -> int:
 
         config = json.loads((Path(__file__).resolve().parents[1] / "config/repositories.json").read_text())
         environment = dict(os.environ)
-        poll(config, environment, github_request, installation_token)
-        maintain_scheduler_activity(environment, github_request)
+        count = poll(config, environment, github_request, installation_token)
+        if environment.get("RELEASE_POLL_DRY_RUN") == "true":
+            print(f"Release polling dry run: {count} eligible release(s); no dispatch or writes.", flush=True)
+        else:
+            maintain_scheduler_activity(environment, github_request)
     except PollFailure as error:
         print(f"Release polling failed (code={error.code}).", flush=True)
         return error.code
