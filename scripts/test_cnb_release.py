@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -125,6 +126,21 @@ class ControllerTests(unittest.TestCase):
 
 
 class ReceiverTests(unittest.TestCase):
+    def test_extension_loads_under_forced_ssh_python_isolation(self):
+        root=Path(__file__).resolve().parents[1]
+        script='''import importlib.util, pathlib
+spec=importlib.util.spec_from_file_location('receiver', %r)
+receiver=importlib.util.module_from_spec(spec);spec.loader.exec_module(receiver)
+receiver.OPS=pathlib.Path(%r)
+checked=[]
+receiver.private=lambda path: checked.append(path.name)
+module, context=receiver.registry_handler()
+assert checked == ['tencent_registry.py', 'cnb_release.py']
+assert callable(module.prepare) and callable(module.pull)
+assert context.OPS == receiver.OPS
+''' % (str(root/'server/tencent_receiver.py'),str(root/'scripts'))
+        subprocess.run([sys.executable,'-I','-c',script],check=True,capture_output=True)
+
     @classmethod
     def setUpClass(cls):
         path=Path(__file__).resolve().parents[1]/'server/tencent_receiver.py'

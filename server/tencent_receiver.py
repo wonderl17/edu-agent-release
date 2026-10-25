@@ -376,6 +376,8 @@ def ticket_expiry(value):
 def registry_handler():
  import types
  path=OPS/'tencent_registry.py';private(path);private(OPS/'cnb_release.py')
+ # The forced SSH command uses Python -I, which excludes the script directory.
+ spec=importlib.util.spec_from_file_location('cnb_release',OPS/'cnb_release.py');contract=importlib.util.module_from_spec(spec);spec.loader.exec_module(contract);sys.modules['cnb_release']=contract
  spec=importlib.util.spec_from_file_location('tencent_registry',path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
  return module,types.SimpleNamespace(**globals())
 def prepare_transfer(h):
