@@ -32,6 +32,13 @@ event('end')
 
 
 class BuildTests(unittest.TestCase):
+    def test_benchmark_cache_is_scoped_to_existing_private_registry(self):
+        self.assertEqual(builder.cache_references('api'), builder.REGISTRY+'/cache-api:main')
+        self.assertEqual(builder.cache_references('web','benchmark-abcdef012345'), builder.REGISTRY+'/cache-web:benchmark-abcdef012345')
+        for tag in ('latest', 'another/registry', 'main,mode=min', 'benchmark-x', ''):
+            with self.assertRaises(ValueError): builder.cache_references('api', tag)
+        with self.assertRaises(ValueError): builder.cache_references('../api')
+
     def jobs(self, root, delays=(0.4, 0.15, 0.15), outcome='ok'):
         return [(kind, [sys.executable, '-c', FAKE_BUILD, kind, str(root/(kind+'.json')),
                         str(root/'events'), str(delay), outcome if kind == 'api' else 'ok'], root/(kind+'.json'))

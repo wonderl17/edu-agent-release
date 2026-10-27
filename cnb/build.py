@@ -20,6 +20,13 @@ def run(args, **kwargs):
     return subprocess.check_output(args, **kwargs)
 
 
+def cache_references(kind, tag="main"):
+    # Isolate explicitly requested build experiments from Production cache writes.
+    if kind not in ("api", "worker", "web") or (tag != "main" and not re.fullmatch(r"benchmark-[0-9a-f]{12}", tag)):
+        raise ValueError("cache scope")
+    return REGISTRY + "/cache-" + kind + ":" + tag
+
+
 def stop_builds(active):
     """Cancel every process group, including descendants, before removing logs/config."""
     for process, _start, _log, _metadata in active.values():
@@ -106,6 +113,8 @@ def main():
     concurrency = os.environ.get("CNB_BUILD_CONCURRENCY", "2")
     if concurrency not in ("1", "2"):
         raise ValueError("build concurrency")
+    cache_tag = os.environ.get("CNB_CACHE_TAG", "main")
+    cache_references("api", cache_tag)
     changelog = (source / "changelog" / (version + ".md")).read_text()
     front = changelog.split("---", 2)
     if (len(front) != 3 or front[0].strip() or not front[2].strip() or
@@ -123,7 +132,7 @@ def main():
         jobs = []
         for kind in ("api", "worker", "web"):
             tag = REGISTRY + "/" + kind + ":" + request_id
-            cache = REGISTRY + "/cache-" + kind + ":main"
+            cache = cache_references(kind, cache_tag)
             metadata = Path(directory) / (kind + ".json")
             command = ["docker", "buildx", "build", "--platform", "linux/amd64",
                        "--provenance=false", "--sbom=false", "--push", "--progress=plain",
@@ -132,6 +141,8 @@ def main():
                        "--cache-from", "type=registry,ref=" + cache,
                        "--cache-to", "type=registry,ref=" + cache + ",mode=max,image-manifest=true,oci-mediatypes=true",
                        "--metadata-file", str(metadata), "--file", "Dockerfile." + kind, "--tag", tag]
+            if cache_tag != "main":
+                command += ["--cache-from", "type=registry,ref=" + cache_references(kind)]
             if kind == "web":
                 command += ["--build-arg", "VITE_API_BASE_URL=/api", "--build-arg",
                             "VITE_DEPLOY_ENV=shukezhinao-prod", "--build-arg", "VITE_BUILD_SHA=" + sha]
