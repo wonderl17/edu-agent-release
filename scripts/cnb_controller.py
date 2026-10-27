@@ -79,8 +79,9 @@ def verify_access(token):
     api(token, "GET", "/-/build/logs?page=1&page_size=1")
 
 
-def build(source, sha, version, private, child, log, token, run, status, usage=None, run_id=None, run_attempt=None):
-    if not SHA.fullmatch(sha):
+def build(source, sha, version, private, child, log, token, run, status, usage=None, run_id=None, run_attempt=None,
+          concurrency="2"):
+    if not SHA.fullmatch(sha) or concurrency not in ("1", "2"):
         raise ValueError("CNB configuration")
     # Never send source to a public/mistaken destination.
     verify_access(token)
@@ -98,7 +99,7 @@ def build(source, sha, version, private, child, log, token, run, status, usage=N
         title += " [GitHub " + run_id + "/" + run_attempt + "]"
     result = api(token, "POST", "/-/build/start", {
         "branch": "main", "sha": snapshot, "event": "api_trigger_tencent",
-        "env": {"RELEASE_REQUEST_ID": request_id}, "title": title})
+        "env": {"RELEASE_REQUEST_ID": request_id, "CNB_BUILD_CONCURRENCY": concurrency}, "title": title})
     sn = result.get("sn", "")
     if result.get("success") is not True or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sn):
         raise ValueError("CNB trigger failed")

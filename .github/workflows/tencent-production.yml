@@ -22,6 +22,11 @@ on:
         description: Prior Production stage/release ticket for exact-source original-package resume
         type: string
         default: ''
+      cnb_concurrency:
+        description: Maximum concurrent image builds; 1 is available for controlled comparisons
+        type: choice
+        default: '2'
+        options: ['1', '2']
 
 permissions:
   contents: read
@@ -66,4 +71,5 @@ jobs:
           TENCENT_SOURCE_SHA: ${{ inputs.source_sha }}
           TENCENT_CONFIRM_RELEASE: ${{ inputs.confirm_release }}
           TENCENT_PREVIOUS_TRANSFER_TICKET: ${{ inputs.previous_transfer_ticket }}
+          TENCENT_CNB_BUILD_CONCURRENCY: ${{ inputs.cnb_concurrency || '2' }}
         run: python3 scripts/tencent_production.py

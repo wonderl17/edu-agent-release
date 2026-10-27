@@ -62,6 +62,12 @@ class ManifestTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_invalid_concurrency_is_rejected_before_access_or_source_sync(self):
+        with patch.object(controller, 'api') as api:
+            with self.assertRaises(ValueError):
+                controller.build(None, 'a'*40, '0.0.129', None, {}, None, 'SECRET', None, print, concurrency='3')
+            api.assert_not_called()
+
     def test_access_preflight_is_read_only_and_rejects_missing_or_wrong_credentials(self):
         with patch.object(controller, 'api', return_value=dict(visibility_level='Private', path=contract.REPO)) as api:
             controller.verify_access('SECRET')

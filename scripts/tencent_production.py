@@ -75,6 +75,8 @@ def configuration(env):
         raise Failure(40)
     if operation == "automatic" and requested:
         raise Failure(40)
+    if env.get("TENCENT_CNB_BUILD_CONCURRENCY", "2") not in ("1", "2"):
+        raise Failure(40)
     return operation, requested
 
 
@@ -504,7 +506,8 @@ def execute(env):
                         if backend == "cnb":
                             bundle = build_cnb(source, sha, version, private, child, log,
                                                env.get("TENCENT_CNB_TOKEN", ""), run, status, usage=usage,
-                                               run_id=env.get("GITHUB_RUN_ID"), run_attempt=env.get("GITHUB_RUN_ATTEMPT"))
+                                               run_id=env.get("GITHUB_RUN_ID"), run_attempt=env.get("GITHUB_RUN_ATTEMPT"),
+                                               concurrency=env.get("TENCENT_CNB_BUILD_CONCURRENCY", "2"))
                             metadata = digest(bundle)
                             ticket = remote(ssh, child, log, dict(base, action="prepare-registry",
                                 bundleBytes=metadata["bytes"], bundleSha256=metadata["sha256"],
