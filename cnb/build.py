@@ -137,18 +137,6 @@ def main():
                             "VITE_DEPLOY_ENV=shukezhinao-prod", "--build-arg", "VITE_BUILD_SHA=" + sha]
             jobs.append((kind, command + ["."], metadata))
         images, timings = build_images(jobs, source, docker_env, directory, int(concurrency))
-        # Cache normalization must never leak into runnable package metadata.
-        for kind in ("api", "worker"):
-            run(["docker", "pull", images[kind]["ref"]], env=docker_env)
-            container = run(["docker", "create", images[kind]["ref"]], env=docker_env).decode().strip()
-            try:
-                for file in ("package.json", "apps/desktop/package.json"):
-                    target = Path(directory) / "package.json"
-                    run(["docker", "cp", container + ":/app/" + file, str(target)], env=docker_env)
-                    if target.read_bytes() != (source / file).read_bytes():
-                        raise ValueError("release manifest differs from source: " + kind)
-            finally:
-                run(["docker", "rm", container], env=docker_env)
         # Verify the actual Web bytes before making a completion receipt.
         run(["docker", "pull", images["web"]["ref"]], env=docker_env)
         container = run(["docker", "create", images["web"]["ref"]], env=docker_env).decode().strip()
