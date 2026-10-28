@@ -18,6 +18,10 @@ on:
         type: choice
         default: 'no'
         options: ['no', 'yes']
+      rebuild_current:
+        description: Rebuild and redeploy the exact currently running source and version with all checks
+        type: boolean
+        default: false
       previous_transfer_ticket:
         description: Prior Production stage/release ticket for exact-source original-package resume
         type: string
@@ -70,6 +74,7 @@ jobs:
           TENCENT_OPERATION: ${{ inputs.operation }}
           TENCENT_SOURCE_SHA: ${{ inputs.source_sha }}
           TENCENT_CONFIRM_RELEASE: ${{ inputs.confirm_release }}
+          TENCENT_REBUILD_CURRENT: ${{ inputs.rebuild_current && 'true' || 'false' }}
           TENCENT_PREVIOUS_TRANSFER_TICKET: ${{ inputs.previous_transfer_ticket }}
           TENCENT_CNB_BUILD_CONCURRENCY: ${{ inputs.cnb_concurrency || '2' }}
         run: python3 scripts/tencent_production.py

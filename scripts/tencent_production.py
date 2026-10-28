@@ -77,6 +77,9 @@ def configuration(env):
         raise Failure(40)
     if env.get("TENCENT_CNB_BUILD_CONCURRENCY", "2") not in ("1", "2"):
         raise Failure(40)
+    rebuild = env.get("TENCENT_REBUILD_CURRENT", "false")
+    if rebuild not in ("false", "true") or (rebuild == "true" and (operation != "deploy" or not requested)):
+        raise Failure(40)
     return operation, requested
 
 
@@ -127,8 +130,14 @@ def version_tuple(value):
     return tuple(map(int, value.split(".")))
 
 
-def should_deploy(operation, version, target, baseline, source_sha=None):
-    if source_sha is not None and source_sha == target.get("currentSourceSha") and version == target["version"]:
+def should_deploy(operation, version, target, baseline, source_sha=None, *, rebuild_current=False):
+    current_identity = (source_sha is not None and source_sha == target.get("currentSourceSha") and
+                        version == target["version"])
+    if rebuild_current:
+        if operation != "deploy" or not current_identity:
+            raise Failure(41)
+        return True
+    if current_identity:
         return False
     current = version_tuple(version)
     threshold = max(version_tuple(baseline), version_tuple(target["version"]),
@@ -467,7 +476,9 @@ def execute(env):
                         return
                     if initial and (sha != INITIAL_SOURCE_SHA or version != INITIAL_VERSION):
                         raise Failure(41)
-                    if operation != "stage" and not initial and not should_deploy(operation, version, target, env.get("TENCENT_PRODUCTION_BASELINE_VERSION", "0.0.125"), sha):
+                    if operation != "stage" and not initial and not should_deploy(
+                            operation, version, target, env.get("TENCENT_PRODUCTION_BASELINE_VERSION", "0.0.125"), sha,
+                            rebuild_current=env.get("TENCENT_REBUILD_CURRENT", "false") == "true"):
                         status("Tencent Production: no release required.")
                         outcome = "success"
                         return
