@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Root-only, journalled admission/token changes. No release or model calls.
+"""Root-only, journalled admission, token and approved endpoint changes. No model calls.
 
 Install alongside receiver.py after review. `apply` reads a bounded JSON request
 from stdin; secrets never belong in argv. `recover` resolves an interrupted
@@ -187,7 +187,6 @@ def apply(c, request):
         c.require(digest(current_settings)==request['settingsSha256'] and digest(current_override)==request['overrideSha256'],
                   'CODEX_CONFIGURATION_STALE_REQUEST')
         previous=policy.settings(c.decode(current_settings))
-        c.require(previous['modelBaseUrls']==desired['modelBaseUrls'],'CODEX_CONFIGURATION_ENDPOINT_CHANGE_REFUSED')
         version,containers=c.current(); before=identities(c,containers)
         c.require(c.ops.snapshot()['healthy'],'CODEX_CONFIGURATION_UNHEALTHY_SOURCE')
         if previous==desired:return dict(status='unchanged',modelCalls=0)

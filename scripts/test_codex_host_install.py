@@ -111,6 +111,13 @@ class InstallationTests(unittest.TestCase):
         for name in [*install.FILES,install.SETTINGS,install.RECEIPT]:self.assertEqual((f.root/name).stat().st_mode&0o777,0o600)
         self.assertFalse((f.root/install.PENDING).exists());self.assertFalse(list(f.root.rglob('*.install-*')))
 
+    def test_initial_install_accepts_approved_root_and_versioned_endpoints_while_closed(self):
+        f=self.fixture();urls=['https://model.example.com/v1','https://api.deepseek.com']
+        self.assertEqual(f.installer().apply({'modelBaseUrls':urls})['status'],'installed')
+        settings=json.loads((f.root/install.SETTINGS).read_bytes())
+        self.assertEqual(settings['modelBaseUrls'],urls)
+        self.assertEqual((settings['rolloutMode'],settings['userIds']),('closed',[]))
+
     def test_each_successful_write_interruption_recovers_exact_old_or_durable_new_state(self):
         f=self.fixture();events=[];host=f.installer();host.fault=lambda name,raw:events.append((name,raw));host.apply({'modelBaseUrls':URLS})
         self.assertEqual(len(events),13)

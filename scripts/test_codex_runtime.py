@@ -48,6 +48,20 @@ class RuntimePolicyTests(unittest.TestCase):
         self.assertNotIn('DATABASE_URL',runner['environment']); self.assertNotIn('REDIS_URL',runner['environment'])
         with self.assertRaisesRegex(ValueError,'IMAGE_SCOPE'): runtime.extension('codex:latest',IDENTITY,configuration())
 
+    def test_approved_https_root_and_versioned_endpoints_keep_exact_scope(self):
+        config=dict(configuration(),modelBaseUrls=['https://api.deepseek.com','https://model.example.com/v1'])
+        self.assertEqual(runtime.settings(config),config)
+        value=runtime.extension(IMAGE,IDENTITY,config)
+        self.assertEqual(value['services']['api']['environment']['CODEX_AGENT_ALLOWED_MODEL_BASE_URLS'],
+                         'https://api.deepseek.com,https://model.example.com/v1')
+        self.assertEqual(value['services']['codex-agent-runtime']['environment']['CODEX_AGENT_ALLOWED_MODEL_HOSTS'],
+                         'api.deepseek.com,model.example.com')
+        for bad in ('https://api.deepseek.com/','https://api.deepseek.com?secret=x',
+                    'http://api.deepseek.com','https://user:secret@api.deepseek.com',
+                    'https://127.0.0.1','https://api.deepseek.com:444'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                runtime.settings(dict(config,modelBaseUrls=[bad]))
+
     def candidate(self):
         expected=runtime.extension(IMAGE,IDENTITY,configuration())
         base=dict(services={'api':dict(image='api',environment={'DATABASE_URL':'synthetic'},networks={'app':None}),

@@ -191,9 +191,9 @@ class ConfigurationTests(unittest.TestCase):
         env=json.loads(host.OVERRIDE.read_bytes())['services']['api']['environment']
         self.assertEqual(env['AGENT_WORKFLOWS_ENABLED'],'true');self.assertEqual(env['AGENT_ROLLOUT_USER_IDS'],'')
 
-    def test_stale_request_endpoint_change_and_pending_transaction_do_not_stop_services(self):
+    def test_stale_invalid_endpoint_and_pending_transaction_do_not_stop_services(self):
         for change,code in ((lambda r:r.update(settingsSha256='f'*64),'STALE_REQUEST'),
-                            (lambda r:r['settings'].update(modelBaseUrls=['https://other.example.com/v1']),'ENDPOINT_CHANGE'),
+                            (lambda r:r['settings'].update(modelBaseUrls=['https://127.0.0.1']),'ENDPOINT_INVALID'),
                             (lambda r:r['settings'].update(rolloutMode='all'),'PILOT_MODE')):
             host=self.host();request=host.request();change(request)
             with self.assertRaisesRegex((Refused,ValueError),code):configure.apply(host,request)
@@ -201,6 +201,26 @@ class ConfigurationTests(unittest.TestCase):
         host=self.host();(host.STATE/configure.PENDING).write_text('{}')
         with self.assertRaisesRegex(Refused,'RECOVERY_REQUIRED'):configure.apply(host,host.request())
         self.assertNotIn('stop-api',host.events)
+
+    def test_root_operator_can_change_exact_approved_model_endpoints_transactionally(self):
+        host=self.host();request=host.request()
+        request['settings']['modelBaseUrls']=['https://api.deepseek.com','https://other.example.com/v1']
+        result=configure.apply(host,request)
+        self.assertEqual(result['status'],'configured')
+        self.assertEqual(host.actual_settings['modelBaseUrls'],request['settings']['modelBaseUrls'])
+        self.assertEqual([x for x in host.events if x.startswith('up-')],['up-codex-agent-runtime','up-api'])
+        self.assertLess(host.events.index('validate-candidate'),host.events.index('stop-api'))
+        self.assertFalse((host.STATE/configure.PENDING).exists())
+
+    def test_interrupted_endpoint_change_recovers_original_allowlist(self):
+        host=self.host();request=host.request()
+        request['settings']['modelBaseUrls']=['https://api.deepseek.com']
+        before_settings=host.settings_path.read_bytes();before_override=host.OVERRIDE.read_bytes()
+        self.crash_once(host,'settings-new')
+        with self.assertRaises(SystemExit):configure.apply(host,request)
+        self.assertEqual(configure.recover(host)['status'],'restored')
+        self.assertEqual(host.settings_path.read_bytes(),before_settings)
+        self.assertEqual(host.OVERRIDE.read_bytes(),before_override)
 
     def test_replay_after_success_requires_fresh_state_and_same_config_is_noop(self):
         host=self.host();request=host.request();configure.apply(host,request);count=host.events.count('stop-api')

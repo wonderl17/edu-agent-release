@@ -39,7 +39,8 @@ def settings(value):
         require(url.scheme == 'https' and not url.username and not url.password and not url.query and not url.fragment and
                 url.hostname and re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?', url.hostname) and
                 '.' in url.hostname and not re.fullmatch(r'[0-9.]+', url.hostname) and url.netloc == url.hostname and
-                re.fullmatch(r'/[A-Za-z0-9_/-]*', url.path) and not text.endswith('/'), 'CODEX_MODEL_ENDPOINT_INVALID')
+                (url.path == '' or re.fullmatch(r'/[A-Za-z0-9_/-]*', url.path)) and
+                not text.endswith('/'), 'CODEX_MODEL_ENDPOINT_INVALID')
     require(len(urls) == len(set(urls)), 'CODEX_MODEL_ENDPOINT_DUPLICATE')
     return copy.deepcopy(value)
 
