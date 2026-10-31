@@ -110,6 +110,100 @@ class ProductionBoundaryTests(unittest.TestCase):
                 self.assertEqual([c.args[3]['action'] for c in remote.call_args_list], ['verify'])
                 github.assert_called_once_with('APP_SENTINEL', 'DELETE', '/installation/token')
 
+    def test_runtime_source_rejects_legacy_cos_before_release_side_effects(self):
+        sha = 'b' * 40
+        def clone(_sha, _token, source, _child, _log):
+            (source / 'package.json').write_text('{"version":"0.0.126"}')
+            marker = source / target.RUNTIME_FILES[0]
+            marker.parent.mkdir(parents=True)
+            marker.write_text('{}')
+        def github(_token, method, path, *args):
+            if method == 'GET' and path.endswith('/commits/main'):
+                return {'sha': sha}
+            if method == 'DELETE':
+                return None
+            raise AssertionError('deployment metadata must not be created')
+        for operation in ('verify', 'stage', 'deploy', 'automatic'):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                env = self.environment(RUNNER_TEMP=directory, TENCENT_OPERATION=operation,
+                    TENCENT_BUILD_BACKEND='cos', TENCENT_PRODUCTION_ENABLED='true',
+                    TENCENT_PRODUCTION_AUTOMATIC_ENABLED='true', TENCENT_CONFIRM_RELEASE='yes')
+                if operation != 'automatic':
+                    env['TENCENT_SOURCE_SHA'] = sha
+                with patch.object(target, 'ssh_configuration', return_value=[]), \
+                     patch.object(target, 'remote', return_value=dict(status='verified', configValid=True,
+                         healthy=True, version='0.0.125', currentSourceSha='c'*40)) as remote, \
+                     patch.object(target, 'installation_token', return_value='APP_SENTINEL'), \
+                     patch.object(target, 'clone_source', side_effect=clone), \
+                     patch.object(target, 'github_request', side_effect=github), \
+                     patch.object(target, 'build_bundle') as bundle, \
+                     patch.object(target, 'report_usage'), \
+                     self.assertRaises(target.UnsupportedBuildBackend):
+                    target.execute(env)
+                self.assertEqual([call.args[3]['action'] for call in remote.call_args_list], ['verify'])
+                bundle.assert_not_called()
+
+    def test_legacy_cos_and_cnb_opt_in_remain_supported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            target.require_supported_build_backend('cos', source)
+            marker = source / target.RUNTIME_FILES[0]
+            marker.parent.mkdir(parents=True)
+            marker.write_text('{}')
+            target.require_supported_build_backend('cnb', source)
+            with self.assertRaises(target.UnsupportedBuildBackend):
+                target.require_supported_build_backend('cos', source)
+            with patch.object(target, 'prepare_build_disk') as disk, \
+                 self.assertRaises(target.UnsupportedBuildBackend):
+                target.build_bundle(source, 'b'*40, '0.0.126', source, {}, None)
+            disk.assert_not_called()
+            marker.unlink()
+            marker.symlink_to('missing.json')
+            with self.assertRaises(target.UnsupportedBuildBackend):
+                target.require_supported_build_backend('cos', source)
+            with self.assertRaises(target.UnsupportedBuildBackend):
+                target.require_supported_build_backend('unknown', source)
+
+    def test_resume_reuses_prior_ticket_even_if_cos_cannot_build_runtime(self):
+        sha, previous, ticket = 'b'*40, 'd'*32, 'e'*32
+        def clone(_sha, _token, source, _child, _log):
+            (source / 'package.json').write_text('{"version":"0.0.126"}')
+            marker = source / target.RUNTIME_FILES[0]
+            marker.parent.mkdir(parents=True)
+            marker.write_text('{}')
+        def remote(_ssh, _child, _log, request, *args):
+            action = request['action']
+            if action == 'verify':
+                return dict(status='verified', configValid=True, healthy=True,
+                            version='0.0.125', currentSourceSha='c'*40)
+            if action == 'record-attempt': return {'status': 'attempt_recorded'}
+            if action == 'resume-transfer':
+                self.assertEqual(request['previousTransferTicket'], previous)
+                return dict(status='transfer_resumed', transferTicket=ticket,
+                            bundleBytes=7, bundleSha256='f'*64)
+            if action == 'deploy':
+                self.assertEqual(request['transferTicket'], ticket)
+                return dict(status='deployed', sourceSha=sha, version='0.0.126')
+            raise AssertionError(action)
+        def github(_token, method, path, *args):
+            if method == 'POST' and path.endswith('/deployments'): return {'id': 7}
+            if method in ('POST', 'DELETE'): return None
+            raise AssertionError((method, path))
+        with tempfile.TemporaryDirectory() as directory:
+            env = self.environment(RUNNER_TEMP=directory, TENCENT_OPERATION='resume',
+                TENCENT_BUILD_BACKEND='cos', TENCENT_PRODUCTION_ENABLED='true',
+                TENCENT_CONFIRM_RELEASE='yes', TENCENT_SOURCE_SHA=sha,
+                TENCENT_PREVIOUS_TRANSFER_TICKET=previous, PUBLIC_GH_TOKEN='PUBLIC_SENTINEL')
+            with patch.object(target, 'ssh_configuration', return_value=[]), \
+                 patch.object(target, 'remote', side_effect=remote), \
+                 patch.object(target, 'installation_token', return_value='APP_SENTINEL'), \
+                 patch.object(target, 'clone_source', side_effect=clone), \
+                 patch.object(target, 'github_request', side_effect=github), \
+                 patch.object(target, 'build_bundle') as bundle, \
+                 patch.object(target, 'report_usage'):
+                target.execute(env)
+            bundle.assert_not_called()
+
     def test_same_version_override_is_narrow_and_never_used_for_upgrades(self):
         current = {"version": "0.0.125", "currentSourceSha": "a" * 40}
         override = target.release_request("deploy", "b" * 40, "0.0.125", current)

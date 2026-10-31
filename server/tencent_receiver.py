@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 os.umask(0o077)
 ROOT=Path('/opt/teaching-ai-production');OPS=ROOT/'operations/release'
 RELEASES=ROOT/'releases';OVERRIDE=OPS/'compose.release.yaml';STATE=OPS/'state'
+PROJECT='teaching-production'
 PROTOCOL='teaching-production-ci-v1';SOURCE='shukezhinao/edu-agent'
 MAX_BUNDLE=8*1024**3;MAX_DIAGNOSTICS=5*1024**2;MAX_IMAGES=32*1024**3;MAX_WEB=512*1024**2
 MAX_RELAY=5*1024**3
@@ -307,9 +308,13 @@ def release_lock():
 def initialize():
  global ops
  require(os.geteuid()==0 and ROOT.resolve()==ROOT and OPS.resolve()==OPS and ROOT.stat().st_uid==0,'TARGET_SCOPE_REFUSED')
+ require_host_ready()
  private(OPS/'receiver.py');private(ROOT/'operations/startup/production-ops.py')
  spec=importlib.util.spec_from_file_location('production_ops',ROOT/'operations/startup/production-ops.py');ops=importlib.util.module_from_spec(spec);spec.loader.exec_module(ops)
  ops.fixed_env()
+def require_host_ready():
+ marker=STATE/'codex-host-install.pending.json'
+ require(not(marker.exists()or marker.is_symlink()),'CODEX_HOST_INSTALLATION_RECOVERY_REQUIRED')
 def current():
  ops.preflight();containers=ops.inspect();web=containers['web'];mounts=[x for x in web['Mounts']if x['Destination']=='/usr/share/nginx/html']
  require(len(mounts)==1 and mounts[0]['Type']=='bind'and mounts[0]['RW']is False,'CURRENT_WEB_MOUNT_REFUSED')
@@ -445,20 +450,90 @@ def drain(general):
   value=decode(output)
   if value.get('idle'):return value
   require(time.monotonic()<deadline,'ACTIVE_WORK_DRAIN_TIMEOUT');time.sleep(5)
+def stop_api_for_release(api):
+ command(DOCKER+['stop','--time','30',api['Id']],timeout=45)
+ stopped=decode(command(DOCKER+['inspect',api['Id']]))
+ require(isinstance(stopped,list)and len(stopped)==1 and stopped[0]['Id']==api['Id'] and stopped[0]['Image']==api['Image']and
+         stopped[0]['State'].get('Running')is False and stopped[0]['State'].get('ExitCode')==0 and
+         not stopped[0]['State'].get('OOMKilled')and not stopped[0]['State'].get('Restarting'),'API_SHUTDOWN_INCOMPLETE')
+def stop_workers_for_release(general,ppt):
+ workers=[general,ppt]
+ command(DOCKER+['stop','--time','45']+[worker['Id']for worker in workers],timeout=100)
+ stopped=decode(command(DOCKER+['inspect']+[worker['Id']for worker in workers]))
+ require(isinstance(stopped,list)and len(stopped)==2,'WORKER_SHUTDOWN_INCOMPLETE')
+ actual={item['Id']:item for item in stopped}
+ require(set(actual)=={worker['Id']for worker in workers},'WORKER_SHUTDOWN_INCOMPLETE')
+ for worker in workers:
+  item=actual[worker['Id']];state=item['State']
+  require(item['Image']==worker['Image']and state.get('Running')is False and state.get('ExitCode')==0 and
+          not state.get('OOMKilled')and not state.get('Restarting'),'WORKER_SHUTDOWN_INCOMPLETE')
+def quiesce_for_rollback(before,image_proofs):
+ # Postflight can fail after the new coordinator/Workers accepted work. Keep
+ # their configuration in place until those writers have actually drained.
+ active=ops.inspect();roles={'api':'api','worker-general':'worker','worker-ppt':'worker'}
+ require(all(name in active for name in roles),'ROLLBACK_APPLICATION_SET_INCOMPLETE')
+ for name,kind in roles.items():
+  require(active[name]['Image']in(before[name]['Image'],image_proofs[kind]['targetId']),'ROLLBACK_APPLICATION_IMAGE_CHANGED')
+ # A runner failure may happen before any business container is recreated.
+ # These exact original containers were already drained before migration.
+ if all(active[name]['Id']==before[name]['Id']and active[name]['State'].get('Running')is False and
+        active[name]['State'].get('ExitCode')==0 and not active[name]['State'].get('OOMKilled')and
+        not active[name]['State'].get('Restarting')for name in roles):return
+ stop_api_for_release(active['api'])
+ require(active['worker-general']['State'].get('Running')is True,'ROLLBACK_DRAIN_WORKER_UNAVAILABLE')
+ drain(active['worker-general'])
+ stop_workers_for_release(active['worker-general'],active['worker-ppt'])
 def candidate_override(h,m,web):
- return{'services':{'api':{'image':m['images']['api']['tag']},'worker-general':{'image':m['images']['worker']['tag']},'worker-ppt':{'image':m['images']['worker']['tag']},'web':{'volumes':[{'type':'bind','source':str(web),'target':'/usr/share/nginx/html','read_only':True,'bind':{'create_host_path':True}}]}}}
+ if'codex-runtime'in m['images']:
+  require(all(callable(getattr(ops,name,None))for name in('codex_module','codex_context')),'CODEX_RUNTIME_ACTIVATION_NOT_INSTALLED')
+ value={'services':{'api':{'image':m['images']['api']['tag']},'worker-general':{'image':m['images']['worker']['tag']},'worker-ppt':{'image':m['images']['worker']['tag']},'web':{'volumes':[{'type':'bind','source':str(web),'target':'/usr/share/nginx/html','read_only':True,'bind':{'create_host_path':True}}]}}}
+ if'codex-runtime'in m['images']:
+  runtime=ops.codex_module()
+  require(all(callable(getattr(runtime,name,None))for name in('extension','load_settings','probe','inspect_api')),'CODEX_RUNTIME_ACTIVATION_NOT_INSTALLED')
+  extra=runtime.extension(m['images']['codex-runtime']['tag'],m['runtime'],runtime.load_settings(ops))
+  for name,service in extra['services'].items():value['services'].setdefault(name,{}).update(service)
+  value['networks']=extra['networks']
+ return value
 def candidate_preflight(h,m,web):
- path=run_dir/'candidate-compose.release.json';atomic(path,candidate_override(h,m,web))
+ value=candidate_override(h,m,web);path=run_dir/'candidate-compose.release.json';atomic(path,value)
  candidate=decode(command(ops.compose_argv(include_release=False)+['-f',str(path),'config','--format','json']))
  ops.validate_release(ops.config(include_release=False),candidate)
+ return value
+def remove_obsolete_runtime():
+ ids=command(DOCKER+['ps','-aq','--filter','label=com.docker.compose.project='+PROJECT,'--filter','label=com.docker.compose.service=codex-agent-runtime']).decode().split()
+ require(len(ids)<=1 and all(re.fullmatch('[0-9a-f]{12,64}',x)for x in ids),'CODEX_ORPHAN_SCOPE_REFUSED')
+ if not ids:return
+ containers=decode(command(DOCKER+['inspect',*ids]))
+ require(len(containers)==len(ids),'CODEX_ORPHAN_SCOPE_REFUSED')
+ for identity,container in zip(ids,containers):
+  labels=container['Config'].get('Labels',{})
+  require(container['Id'].startswith(identity)and labels.get('com.docker.compose.project')==PROJECT and labels.get('com.docker.compose.service')=='codex-agent-runtime'and labels.get('com.docker.compose.oneoff')=='False'and container['Config'].get('User')=='1000:1000'and all(m.get('Type')=='tmpfs'and m.get('Destination')=='/tmp'for m in container.get('Mounts',[])),'CODEX_ORPHAN_SCOPE_REFUSED')
+ command(DOCKER+['rm','--force',*ids],timeout=30)
 def up_four():
+ configured=ops.preflight()
+ runtime='codex-agent-runtime'in configured['services']
+ if runtime:command(ops.compose_argv()+['up','-d','--no-deps','--no-build','--pull','never','--force-recreate','--wait','--wait-timeout','90','codex-agent-runtime'],timeout=120)
  command(ops.compose_argv()+['up','-d','--no-deps','--no-build','--pull','never','--force-recreate','--wait','--wait-timeout','180','api','worker-general','worker-ppt','web'],timeout=300)
+ if not runtime:remove_obsolete_runtime()
+def verify_restored(value,before,recreated):
+ deadline=time.monotonic()+180
+ while True:
+  sample=ops.snapshot()
+  if sample['healthy']:break
+  require(time.monotonic()<deadline,'ROLLBACK_HEALTH_NOT_RESTORED');time.sleep(4)
+ restored,after=current();require(restored==value and set(after)==set(before),'ROLLBACK_IDENTITY_NOT_RESTORED')
+ for name in before:
+  require(after[name]['Image']==before[name]['Image'],'ROLLBACK_IMAGE_NOT_RESTORED')
+  if not recreated or name in('gateway','postgres','redis','storage'):
+   require(after[name]['Id']==before[name]['Id'],'ROLLBACK_CONTAINER_NOT_RESTORED')
+  if name in('gateway','postgres','redis','storage'):
+   require(after[name]['State']['StartedAt']==before[name]['State']['StartedAt'],'IMMUTABLE_SERVICE_CHANGED')
 def migration(h,m):
  env=ops.config()['services']['api']['environment'];ops.isolation(env,'api')
  require('\n'not in env['DATABASE_URL']and'\r'not in env['DATABASE_URL'],'MIGRATION_DATABASE_URL_INVALID')
  filename=run_dir/'migration.env';atomic(filename,('DATABASE_URL='+env['DATABASE_URL']+'\nNODE_ENV=production\nPRISMA_MIGRATE_DEPLOY=false\nPRISMA_DB_PUSH=false\n').encode())
- name='teaching-production-migrate-'+h['sourceSha'][:12]+'-'+uuid.uuid4().hex[:8]
- try:command(DOCKER+['run','--rm','--name',name,'--network','teaching-production_app','--env-file',str(filename),'--entrypoint','/usr/local/bin/pnpm',m['images']['api']['tag'],'exec','prisma','migrate','deploy','--schema','/app/prisma/schema.prisma'],timeout=600)
+ name=PROJECT+'-migrate-'+h['sourceSha'][:12]+'-'+uuid.uuid4().hex[:8]
+ try:command(DOCKER+['run','--rm','--name',name,'--network',PROJECT+'_app','--env-file',str(filename),'--entrypoint','/usr/local/bin/pnpm',m['images']['api']['tag'],'exec','prisma','migrate','deploy','--schema','/app/prisma/schema.prisma'],timeout=600)
  finally:
   filename.unlink(missing_ok=True)
   subprocess.run(DOCKER+['rm','--force',name],capture_output=True,timeout=30,env=ops.fixed_env())
@@ -470,11 +545,17 @@ def postflight(h,m,before,image_proofs):
   require(time.monotonic()<deadline,'RELEASE_HEALTH_TIMEOUT');time.sleep(4)
  value,after=current();require(value['version']==h['version']and value['buildSha']==h['sourceSha'],'RUNNING_WEB_VERSION_MISMATCH')
  for name,kind in [('api','api'),('worker-general','worker'),('worker-ppt','worker')]:require(after[name]['Image']==image_proofs[kind]['targetId'],'RUNNING_IMAGE_ID_MISMATCH')
+ runtime_health=None
+ if'codex-runtime'in m['images']:
+  require(after['codex-agent-runtime']['Image']==image_proofs['codex-runtime']['targetId'],'RUNNING_CODEX_IMAGE_ID_MISMATCH')
+  runtime_health=ops.codex_module().probe(ops.codex_context(),after['api']['Id'],m['runtime'])
  for name in('gateway','postgres','redis','storage'):require(after[name]['Id']==before[name]['Id']and after[name]['State']['StartedAt']==before[name]['State']['StartedAt'],'IMMUTABLE_SERVICE_CHANGED')
  response=decode(command(['/usr/bin/curl','--silent','--show-error','--fail','--max-time','10','http://127.0.0.1:28080/version.json'],timeout=15));require(response.get('version')==h['version']and response.get('buildSha')==h['sourceSha'],'PUBLIC_WEB_VERSION_MISMATCH')
- return{'healthy':True,'version':h['version'],'sourceSha':h['sourceSha'],'workerConsumers':[x['workers']for x in sample['dependencies']['consumers']],'images':image_proofs,'immutableServicesPreserved':4,'modelsInvokedByReceiver':0}
+ return{'healthy':True,'version':h['version'],'sourceSha':h['sourceSha'],'workerConsumers':[x['workers']for x in sample['dependencies']['consumers']],'images':image_proofs,'immutableServicesPreserved':4,'modelsInvokedByReceiver':0,**({'codex':runtime_health}if runtime_health else{})}
 def deploy(h,stream):
  global run_dir,phase,rolling_back
+ require_host_ready()
+ require(not(STATE/'codex-configuration.pending.json').exists(),'CODEX_CONFIGURATION_RECOVERY_REQUIRED')
  if ops.fixed_env()['PRODUCTION_ACTIVATED']=='false':
   handler,context=initial_handler();return handler.deploy(context,h,stream)
  require('initialGateId'not in h,'INITIAL_GATE_ON_ACTIVE_RUNTIME_REFUSED')
@@ -509,36 +590,40 @@ def deploy(h,stream):
   shutil.rmtree(web)
  else:
   target.mkdir(mode=0o700);shutil.move(str(web),target/'web-dist');atomic(target/'manifest.json',(run_dir/'manifest.json').read_bytes())
- phase='candidate-preflight';candidate_preflight(h,m,target/'web-dist')
+ phase='candidate-preflight';candidate=candidate_preflight(h,m,target/'web-dist')
  previous=OVERRIDE.read_bytes()if OVERRIDE.exists()else None
  atomic(run_dir/'rollback-metadata.json',{'previousOverridePresent':previous is not None,'previousSourceSha':value['buildSha'],'snapshotId':snapshot_id})
  if previous is not None:atomic(run_dir/'previous-compose.release.yaml',previous)
  stopped=False;switched=False;migration_started=False;migration_ok=False
  with ops.maintenance('ci-release-'+h['sourceSha'][:12],minutes=45):
   try:
-   phase='drain';stopped=True;command(DOCKER+['stop','--time','30',before['api']['Id']],timeout=45);drain(before['worker-general'])
-   command(DOCKER+['stop','--time','45',before['worker-general']['Id'],before['worker-ppt']['Id']],timeout=100)
+   phase='drain';stopped=True;stop_api_for_release(before['api']);drain(before['worker-general'])
+   stop_workers_for_release(before['worker-general'],before['worker-ppt'])
    phase='migration';migration_started=True;migration(h,m);migration_ok=True
-   phase='activate';switched=True;atomic(OVERRIDE,candidate_override(h,m,target/'web-dist'));ops.preflight();up_four()
+   phase='activate';switched=True;atomic(OVERRIDE,candidate);ops.preflight();up_four()
    phase='verify';verification=postflight(h,m,before,image_proofs)
    finish_liveness()
    result={'status':'deployed','version':h['version'],'sourceSha':h['sourceSha'],'snapshotId':snapshot_id,'backupPolicy':'mac-direct-daily-no-pre-release-backup','verification':verification,'deployedAt':utc(),'sourceRepository':SOURCE}
    atomic(STATE/'last-success.json',result);atomic(target/'deployment-receipt.json',result)
   except Exception as error:
    rolling_back=True
-   phase_before_rollback=phase;rollback_ok=True
+   phase_before_rollback=phase;rollback_ok=True;rollback_cause=None
    try:
     if switched:
+     quiesce_for_rollback(before,image_proofs)
      if previous is None:OVERRIDE.unlink(missing_ok=True)
      else:atomic(OVERRIDE,previous)
      up_four()
     elif stopped:command(DOCKER+['start',before['api']['Id'],before['worker-general']['Id'],before['worker-ppt']['Id']],timeout=60)
-   except Exception:rollback_ok=False
-   result={'status':'failed','code':'DEPLOY_FAILED_ROLLBACK_RESTORED'if rollback_ok else'DEPLOY_FAILED_ROLLBACK_INCOMPLETE','causeCode':str(error)if isinstance(error,Refused)else type(error).__name__,'phase':phase_before_rollback,'version':h['version'],'sourceSha':h['sourceSha'],'snapshotId':snapshot_id,'configurationRollbackSucceeded':rollback_ok,'databaseAutomaticallyRestored':False,'migrationStarted':migration_started,'migrationSucceeded':migration_ok,'manualDatabaseReviewRequired':migration_started,'failedAt':utc()}
+    if stopped:verify_restored(value,before,recreated=switched)
+   except Exception as rollback_error:rollback_ok=False;rollback_cause=str(rollback_error)if isinstance(rollback_error,Refused)else type(rollback_error).__name__
+   result={'status':'failed','code':'DEPLOY_FAILED_ROLLBACK_RESTORED'if rollback_ok else'DEPLOY_FAILED_ROLLBACK_INCOMPLETE','causeCode':str(error)if isinstance(error,Refused)else type(error).__name__,'rollbackCauseCode':rollback_cause,'phase':phase_before_rollback,'version':h['version'],'sourceSha':h['sourceSha'],'snapshotId':snapshot_id,'configurationRollbackSucceeded':rollback_ok,'databaseAutomaticallyRestored':False,'migrationStarted':migration_started,'migrationSucceeded':migration_ok,'manualDatabaseReviewRequired':migration_started,'failedAt':utc()}
    atomic(STATE/'last-failure.json',result);atomic(run_dir/'failure-receipt.json',result);return result
  return result
 def stage(h,stream):
  global run_dir,phase
+ require_host_ready()
+ require(not(STATE/'codex-configuration.pending.json').exists(),'CODEX_CONFIGURATION_RECOVERY_REQUIRED')
  require('transferTicket'in h,'STAGE_RELAY_REQUIRED')
  if ops.fixed_env()['PRODUCTION_ACTIVATED']=='false':
   ready=ops.bootstrap_ready();require(version_compare(h['version'],ready['version'])>=0,'VERSION_REGRESSION_REFUSED');require(not h.get('allowSameVersionSourceChange'),'BOOTSTRAP_OVERRIDE_REFUSED')

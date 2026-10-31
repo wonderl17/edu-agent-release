@@ -8,7 +8,7 @@ import tarfile
 import time
 import uuid
 
-from cnb_release import canonical, validate_manifest
+from cnb_release import canonical, validate_manifest, RUNTIME_KIND, RUNTIME_LABELS, inspect_runtime_image
 
 
 def validate(c, value, h):
@@ -82,6 +82,21 @@ def image_identity(c, item, image, h):
     return dict(sourceId=item['id'], targetId=image['Id'], registryDigestVerified=True, comparison=comparison)
 
 
+def runtime_identity(c, runtime, item, image):
+    config = image.get('Config', {})
+    c.require(all(config.get('Labels', {}).get(label) == runtime[key] for key, label in RUNTIME_LABELS.items()) and
+              config.get('User') == 'node' and config.get('WorkingDir') == '/app' and
+              config.get('Cmd') == ['node', 'server.mjs'] and not config.get('Entrypoint'),
+              'REGISTRY_RUNTIME_CONFIG_MISMATCH')
+    try:
+        return inspect_runtime_image(runtime, item['ref'], c.run_dir,
+            lambda args: c.command(c.DOCKER + args),
+            lambda args: subprocess.run(c.DOCKER + args, capture_output=True, timeout=30,
+                                       env=c.ops.fixed_env(), check=False))
+    except (ValueError, TypeError, KeyError, OSError):
+        raise c.Refused('REGISTRY_RUNTIME_PACKAGE_MISMATCH')
+
+
 def pull(c, h, stream, record):
     raw = validate(c, record.get('registryManifest'), h)
     c.start_liveness(stream)
@@ -99,6 +114,8 @@ def pull(c, h, stream, record):
         c.command(docker + ['pull', '--platform', 'linux/amd64', item['ref']], timeout=1800)
         image = c.decode(c.command(c.DOCKER + ['image', 'inspect', item['ref']]))[0]
         proofs[kind] = image_identity(c, item, image, h)
+        if kind == RUNTIME_KIND:
+            proofs[kind]['runtime'] = runtime_identity(c, manifest['runtime'], item, image)
         timings[kind] = round(time.monotonic() - start, 3)
     # docker create/cp never executes candidate code or contacts application data.
     container = c.command(c.DOCKER + ['create', manifest['images']['web']['ref']]).decode().strip()

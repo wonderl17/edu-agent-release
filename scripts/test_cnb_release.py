@@ -91,7 +91,7 @@ class ControllerTests(unittest.TestCase):
             if '/status/' in path:return dict(status='running')
             return {}
         with tempfile.TemporaryDirectory() as directory, patch.object(controller,'api',side_effect=api), \
-             patch.object(controller,'mirror',return_value=('c'*40,'b'*40)), \
+             patch.object(controller,'mirror',return_value=('c'*40,'b'*40,None)), \
              patch.object(controller.time,'sleep',side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 controller.build(Path(directory),'a'*40,'0.0.126',Path(directory),{},None,'SECRET',None,messages.append)
@@ -112,7 +112,7 @@ class ControllerTests(unittest.TestCase):
             if '/status/' in path:return dict(status='success')
             return []
         with tempfile.TemporaryDirectory() as directory, patch.object(controller,'api',side_effect=api), \
-             patch.object(controller,'mirror',return_value=('c'*40,'b'*40)):
+             patch.object(controller,'mirror',return_value=('c'*40,'b'*40,None)):
             with self.assertRaisesRegex(ValueError,'receipt missing'):
                 controller.build(None,'a'*40,'0.0.126',Path(directory),{},None,'SECRET',None,lambda *_:None)
             self.assertFalse((Path(directory)/'registry-manifest.json').exists())
@@ -133,7 +133,8 @@ class ControllerTests(unittest.TestCase):
                 command=[str(dest) if x=='https://cnb.cool/'+contract.REPO+'.git' else x for x in command]
                 return production.run(command,env,log,**kw)
             with (root/'log').open('w+b') as log:
-                snapshot,tree=controller.mirror(source,sha,'0.0.126',private,child,log,'SYNTHETIC',run)
+                snapshot,tree,runtime=controller.mirror(source,sha,'0.0.126',private,child,log,'SYNTHETIC',run)
+            self.assertIsNone(runtime)
             self.assertEqual(git('rev-parse','main:source',cwd=dest),tree)
             self.assertEqual(git('show','main:source/a.txt',cwd=dest),'new')
             self.assertEqual(git('rev-list','--count','main',cwd=dest),'1')
@@ -143,6 +144,7 @@ class ControllerTests(unittest.TestCase):
             with (root/'log2').open('w+b') as log:
                 controller.mirror(source,sha,'0.0.126',again,child,log,'SYNTHETIC',run)
             self.assertEqual(git('rev-list','--count','main',cwd=dest),'2')
+            self.assertIsNone(runtime)
             self.assertEqual(git('rev-parse','main:source',cwd=dest),tree)
 
 

@@ -12,7 +12,10 @@ import tempfile
 import time
 from urllib.request import Request, urlopen
 
-from cnb_release import REPO, REGISTRY, SOURCE, SHA, DIGEST, canonical, validate_manifest
+from cnb_release import (REPO, REGISTRY, SOURCE, SHA, DIGEST, canonical, validate_manifest,
+                         RUNTIME_KIND, RUNTIME_ROOT, RUNTIME_LABELS, filesystem_runtime, inspect_runtime_image)
+
+CODEX_CACHE_KIND = "codex-runtime"
 
 
 def run(args, **kwargs):
@@ -22,7 +25,7 @@ def run(args, **kwargs):
 
 def cache_references(kind, tag="main"):
     # Isolate explicitly requested build experiments from Production cache writes.
-    if kind not in ("api", "worker", "web") or (tag != "main" and not re.fullmatch(r"benchmark-[0-9a-f]{12}", tag)):
+    if kind not in ("api", "worker", "web", CODEX_CACHE_KIND) or (tag != "main" and not re.fullmatch(r"benchmark-[0-9a-f]{12}", tag)):
         raise ValueError("cache scope")
     return REGISTRY + "/cache-" + kind + ":" + tag
 
@@ -94,6 +97,71 @@ def build_images(jobs, source, docker_env, directory, concurrency=2, timeout=540
                 log.close()
 
 
+def warm_codex_runtime_cache(source, docker_env, directory, cache_tag="main", timeout=300):
+    """Optional cache-only build; never add a service or change the release manifest."""
+    cache = cache_references(CODEX_CACHE_KIND, cache_tag)
+    context = Path("tools/codex-agent-runtime")
+    # Earlier canonical commits do not contain the isolated runner yet.
+    if not (source / context / "Dockerfile").is_file():
+        return "absent"
+    command = ["docker", "buildx", "build", "--platform", "linux/amd64",
+               "--provenance=false", "--sbom=false", "--output=type=cacheonly", "--progress=plain",
+               "--cache-from", "type=registry,ref=" + cache,
+               "--cache-to", "type=registry,ref=" + cache + ",mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true",
+               "--file", str(context / "Dockerfile")]
+    if cache_tag != "main":
+        command += ["--cache-from", "type=registry,ref=" + cache_references(CODEX_CACHE_KIND)]
+    active = {}
+    try:
+        with (Path(directory) / "codex-runtime-cache.log").open("w+b") as log:
+            try:
+                process = subprocess.Popen(command + [str(context)], cwd=source, env=docker_env,
+                                           stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                           start_new_session=True)
+                active[CODEX_CACHE_KIND] = (process, time.monotonic(), log, None)
+                return "completed" if process.wait(timeout=timeout) == 0 else "failed"
+            except subprocess.TimeoutExpired:
+                return "timed_out"
+            finally:
+                # SystemExit/KeyboardInterrupt propagate after terminating the whole build group.
+                stop_builds(active)
+                log.flush()
+                log.seek(0)
+                shutil.copyfileobj(log, sys.stdout.buffer)
+                sys.stdout.buffer.flush()
+    except OSError:
+        return "unavailable"
+
+
+def image_jobs(sha, version, request_id, directory, cache_tag, runtime):
+    """The runtime is a required release image only for explicitly opted-in source."""
+    jobs = []
+    kinds = ("api", "worker", "web") + ((RUNTIME_KIND,) if runtime is not None else ())
+    for kind in kinds:
+        tag = REGISTRY + "/" + kind + ":" + request_id
+        cache = cache_references(kind, cache_tag)
+        metadata = Path(directory) / (kind + ".json")
+        context = RUNTIME_ROOT.rstrip("/") if kind == RUNTIME_KIND else "."
+        dockerfile = RUNTIME_ROOT + "Dockerfile" if kind == RUNTIME_KIND else "Dockerfile." + kind
+        command = ["docker", "buildx", "build", "--platform", "linux/amd64",
+                   "--provenance=false", "--sbom=false", "--push", "--progress=plain",
+                   "--label", "org.opencontainers.image.revision=" + sha,
+                   "--label", "org.opencontainers.image.version=" + version,
+                   "--cache-from", "type=registry,ref=" + cache,
+                   "--cache-to", "type=registry,ref=" + cache + ",mode=max,image-manifest=true,oci-mediatypes=true",
+                   "--metadata-file", str(metadata), "--file", dockerfile, "--tag", tag]
+        if cache_tag != "main":
+            command += ["--cache-from", "type=registry,ref=" + cache_references(kind)]
+        if kind == "web":
+            command += ["--build-arg", "VITE_API_BASE_URL=/api", "--build-arg",
+                        "VITE_DEPLOY_ENV=shukezhinao-prod", "--build-arg", "VITE_BUILD_SHA=" + sha]
+        if kind == RUNTIME_KIND:
+            for key, label in RUNTIME_LABELS.items():
+                command += ["--label", label + "=" + runtime[key]]
+        jobs.append((kind, command + [context], metadata))
+    return jobs
+
+
 def main():
     started = time.monotonic()
     source = Path("source").resolve()
@@ -115,6 +183,7 @@ def main():
         raise ValueError("build concurrency")
     cache_tag = os.environ.get("CNB_CACHE_TAG", "main")
     cache_references("api", cache_tag)
+    runtime = filesystem_runtime(source)
     changelog = (source / "changelog" / (version + ".md")).read_text()
     front = changelog.split("---", 2)
     if (len(front) != 3 or front[0].strip() or not front[2].strip() or
@@ -129,24 +198,7 @@ def main():
             input=token.encode(), env=docker_env)
         # CNB provides a rootless Docker/BuildKit service with registry cache.
         # A nested docker-container driver cannot mount sysfs in that service.
-        jobs = []
-        for kind in ("api", "worker", "web"):
-            tag = REGISTRY + "/" + kind + ":" + request_id
-            cache = cache_references(kind, cache_tag)
-            metadata = Path(directory) / (kind + ".json")
-            command = ["docker", "buildx", "build", "--platform", "linux/amd64",
-                       "--provenance=false", "--sbom=false", "--push", "--progress=plain",
-                       "--label", "org.opencontainers.image.revision=" + sha,
-                       "--label", "org.opencontainers.image.version=" + version,
-                       "--cache-from", "type=registry,ref=" + cache,
-                       "--cache-to", "type=registry,ref=" + cache + ",mode=max,image-manifest=true,oci-mediatypes=true",
-                       "--metadata-file", str(metadata), "--file", "Dockerfile." + kind, "--tag", tag]
-            if cache_tag != "main":
-                command += ["--cache-from", "type=registry,ref=" + cache_references(kind)]
-            if kind == "web":
-                command += ["--build-arg", "VITE_API_BASE_URL=/api", "--build-arg",
-                            "VITE_DEPLOY_ENV=shukezhinao-prod", "--build-arg", "VITE_BUILD_SHA=" + sha]
-            jobs.append((kind, command + ["."], metadata))
+        jobs = image_jobs(sha, version, request_id, directory, cache_tag, runtime)
         images, timings = build_images(jobs, source, docker_env, directory, int(concurrency))
         # Verify the actual Web bytes before making a completion receipt.
         run(["docker", "pull", images["web"]["ref"]], env=docker_env)
@@ -159,10 +211,24 @@ def main():
                 raise ValueError("web version")
         finally:
             run(["docker", "rm", container], env=docker_env)
+        if runtime is not None:
+            run(["docker", "pull", images[RUNTIME_KIND]["ref"]], env=docker_env)
+            inspect_runtime_image(runtime, images[RUNTIME_KIND]["ref"], directory,
+                                  lambda args: run(["docker", *args], env=docker_env),
+                                  lambda args: subprocess.run(["docker", *args], env=docker_env,
+                                                              capture_output=True, timeout=30, check=False))
+        else:
+            cache_started = time.monotonic()
+            cache_status = warm_codex_runtime_cache(source, docker_env, directory, cache_tag)
+            # Preserve the optional cache-only path for older source trees.
+            print("Codex runtime cache build: " + cache_status + "; seconds=" +
+                  str(round(time.monotonic() - cache_started, 3)), flush=True)
         timings["total"] = round(time.monotonic() - started, 3)
-        manifest = dict(schemaVersion=2, deployment="teaching-production", sourceRepository=SOURCE,
+        manifest = dict(schemaVersion=3 if runtime is not None else 2, deployment="teaching-production", sourceRepository=SOURCE,
                         sourceSha=sha, version=version, sourceTree=provenance["sourceTree"],
                         snapshotSha=snapshot, requestId=request_id, images=images, timings=timings)
+        if runtime is not None:
+            manifest["runtime"] = runtime
         validate_manifest(manifest, sha, version, snapshot, request_id)
         payload = {"annotations": [{"key": "tencent-" + request_id, "value": canonical(manifest).decode()}]}
         request = Request("https://api.cnb.cool/" + REPO + "/-/git/commit-annotations/" + snapshot,

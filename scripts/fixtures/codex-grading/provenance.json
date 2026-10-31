@@ -1,0 +1,20 @@
+{
+  "syntheticOnly": true,
+  "source": "isolated grading-upload-1793270793158 local acceptance artifacts",
+  "images": {
+    "answer-key.png": "1114461e61a2726ad7234100b4085216feb85ca69d5aabb08a65deec71aefc0f",
+    "student-answer.png": "8cd31fabcfc8f7b4713ccef8a6f9c4acaeafc033dcdea7caf5f9cb54456677bf"
+  },
+  "responseNodes": {
+    "identity": "submissionIdentity.preflight",
+    "teacher": "teacherExam",
+    "answer": "teacherExam.answerExcerpt",
+    "locate": "studentExcerpt.displayRegion.student-page-1",
+    "fine": "studentExcerpt.displayRegion.student-page-1:region:label%3A1",
+    "profile": "submissionProfile",
+    "regions": "studentExcerpt.answerRegions",
+    "excerpt": "studentExcerpt.subjective.chunk.1",
+    "grading": "grading.chunk.1"
+  },
+  "scope": "Deterministic lifecycle fixture; not provider inference or quality evidence"
+}

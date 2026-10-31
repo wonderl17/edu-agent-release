@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 BUILDER = Path(__file__).resolve().parents[1] / 'cnb/build.py'
@@ -34,6 +35,7 @@ event('end')
 class BuildTests(unittest.TestCase):
     def test_benchmark_cache_is_scoped_to_existing_private_registry(self):
         self.assertEqual(builder.cache_references('api'), builder.REGISTRY+'/cache-api:main')
+        self.assertEqual(builder.cache_references('codex-runtime'), builder.REGISTRY+'/cache-codex-runtime:main')
         self.assertEqual(builder.cache_references('web','benchmark-abcdef012345'), builder.REGISTRY+'/cache-web:benchmark-abcdef012345')
         for tag in ('latest', 'another/registry', 'main,mode=min', 'benchmark-x', ''):
             with self.assertRaises(ValueError): builder.cache_references('api', tag)
@@ -121,6 +123,119 @@ b.build_images([(k,c,pathlib.Path(m)) for k,c,m in jobs],r,os.environ,r)
     def test_invalid_concurrency_starts_nothing(self):
         for concurrency in (0, 3, True, '2'):
             with self.assertRaises(ValueError): builder.build_images([], None, {}, None, concurrency)
+
+    def test_fourth_required_image_failure_cannot_return_a_three_image_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = self.jobs(root, (0, 0, 0))
+            metadata = root/'codex-runtime.json'
+            jobs.append(('codex-runtime', [sys.executable, '-c', FAKE_BUILD, 'codex-runtime', str(metadata),
+                                          str(root/'events'), '0', 'fail'], metadata))
+            with self.assertRaises(subprocess.CalledProcessError):
+                builder.build_images(jobs, root, os.environ, root)
+            self.assertEqual({e['kind'] for e in self.events(root)}, {'api', 'worker', 'web', 'codex-runtime'})
+            self.assert_stopped(self.events(root))
+
+
+class CodexCacheTests(unittest.TestCase):
+    def runtime(self, root):
+        context = root / 'tools/codex-agent-runtime'
+        context.mkdir(parents=True)
+        (context / 'Dockerfile').write_text('FROM scratch\n')
+
+    def test_older_sources_skip_without_starting_a_build(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(builder.subprocess, 'Popen') as popen:
+            root = Path(directory)
+            self.assertEqual(builder.warm_codex_runtime_cache(root, {}, root), 'absent')
+            popen.assert_not_called()
+
+    def test_cache_only_build_uses_private_scoped_cache_and_no_release_output(self):
+        real_popen = subprocess.Popen
+        for cache_tag in ('main', 'benchmark-abcdef012345'):
+            with self.subTest(tag=cache_tag), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); self.runtime(root)
+                def fake_popen(command, **kwargs):
+                    self.assertEqual(command[:3], ['docker', 'buildx', 'build'])
+                    self.assertIn('--output=type=cacheonly', command)
+                    self.assertNotIn('--push', command)
+                    self.assertNotIn('--tag', command)
+                    self.assertNotIn('--build-arg', command)
+                    self.assertEqual(command[command.index('--platform') + 1], 'linux/amd64')
+                    self.assertEqual(command[command.index('--file') + 1], 'tools/codex-agent-runtime/Dockerfile')
+                    self.assertEqual(command[-1], 'tools/codex-agent-runtime')
+                    exports = [command[i + 1] for i, value in enumerate(command) if value == '--cache-to']
+                    self.assertEqual(exports, ['type=registry,ref=' + builder.REGISTRY + '/cache-codex-runtime:' +
+                                               cache_tag + ',mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true'])
+                    imports = [command[i + 1] for i, value in enumerate(command) if value == '--cache-from']
+                    expected = ['type=registry,ref=' + builder.REGISTRY + '/cache-codex-runtime:' + cache_tag]
+                    if cache_tag != 'main': expected.append('type=registry,ref=' + builder.REGISTRY + '/cache-codex-runtime:main')
+                    self.assertEqual(imports, expected)
+                    self.assertEqual(kwargs['cwd'], root)
+                    self.assertTrue(kwargs['start_new_session'])
+                    return real_popen([sys.executable, '-c', 'pass'], **kwargs)
+                with patch.object(builder.subprocess, 'Popen', side_effect=fake_popen):
+                    self.assertEqual(builder.warm_codex_runtime_cache(root, os.environ, root, cache_tag), 'completed')
+
+    def test_build_failure_and_missing_docker_are_nonblocking(self):
+        real_popen = subprocess.Popen
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); self.runtime(root)
+            with patch.object(builder.subprocess, 'Popen', side_effect=lambda _cmd, **kw: real_popen(
+                    [sys.executable, '-c', 'raise SystemExit(7)'], **kw)):
+                self.assertEqual(builder.warm_codex_runtime_cache(root, os.environ, root), 'failed')
+            with patch.object(builder.subprocess, 'Popen', side_effect=OSError('Docker unavailable')):
+                self.assertEqual(builder.warm_codex_runtime_cache(root, os.environ, root), 'unavailable')
+            with patch.object(builder.subprocess, 'Popen') as popen:
+                self.assertEqual(builder.warm_codex_runtime_cache(root, os.environ, root/'missing'), 'unavailable')
+                popen.assert_not_called()
+
+    def test_timeout_stops_the_build_without_blocking_release(self):
+        real_popen = subprocess.Popen
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); self.runtime(root)
+            processes = []
+            def fake_popen(_command, **kwargs):
+                process = real_popen([sys.executable, '-c', 'import time; time.sleep(30)'], **kwargs)
+                processes.append(process)
+                return process
+            with patch.object(builder.subprocess, 'Popen', side_effect=fake_popen):
+                self.assertEqual(builder.warm_codex_runtime_cache(root, os.environ, root, timeout=0.2), 'timed_out')
+            self.assertIsNotNone(processes[0].poll())
+            with self.assertRaises(ProcessLookupError): os.kill(processes[0].pid, 0)
+
+    def test_sigterm_is_not_swallowed_and_stops_cache_build_descendants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); self.runtime(root)
+            executable = root / 'docker'
+            executable.write_text('#!' + sys.executable + '\n' + '''
+import os, pathlib, subprocess, sys, time
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+pathlib.Path('cache-pids').write_text(str(os.getpid()) + ',' + str(child.pid))
+child.wait()
+''')
+            executable.chmod(0o700)
+            script = '''
+import importlib.util, os, pathlib, signal, sys
+sys.path.insert(0, sys.argv[1])
+s=importlib.util.spec_from_file_location('builder',sys.argv[2]); b=importlib.util.module_from_spec(s);s.loader.exec_module(b)
+signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(143)))
+r=pathlib.Path(sys.argv[3]); b.warm_codex_runtime_cache(r,dict(os.environ,PATH=str(r)),r)
+'''
+            process = subprocess.Popen([sys.executable, '-c', script, str(BUILDER.parents[1]/'scripts'), str(BUILDER), directory])
+            try:
+                deadline = time.monotonic() + 5
+                while not (root/'cache-pids').exists():
+                    if time.monotonic() > deadline: self.fail('cache build did not start')
+                    time.sleep(0.02)
+                pids = [int(value) for value in (root/'cache-pids').read_text().split(',')]
+                process.send_signal(signal.SIGTERM)
+                self.assertEqual(process.wait(timeout=8), 143)
+                # The grandchild may briefly remain as a zombie until init reaps it.
+                for pid in pids:
+                    state = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True)
+                    self.assertTrue(state.returncode != 0 or state.stdout.strip().startswith('Z'))
+            finally:
+                if process.poll() is None: process.kill(); process.wait()
 
 
 if __name__ == '__main__': unittest.main()

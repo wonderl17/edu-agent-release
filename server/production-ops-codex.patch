@@ -1,0 +1,163 @@
+--- a/production-ops.py
++++ b/production-ops.py
+@@ -4,6 +4,7 @@
+ import datetime as dt
+ import fcntl
+ import hashlib
++import importlib.util
+ import json
+ import os
+ from pathlib import Path
+@@ -13,6 +14,7 @@
+ import subprocess
+ import sys
+ import time
++import types
+ from urllib.parse import urlparse
+ 
+ ROOT = Path('/opt/teaching-ai-production')
+@@ -22,6 +24,7 @@
+ SCOPE = 'tencent-production-20261024'
+ SERVICES = ('postgres', 'redis', 'storage', 'api', 'worker-general', 'worker-ppt', 'web', 'gateway')
+ WORKERS = ('worker-general', 'worker-ppt')
++CODEX_SERVICES = ('codex-agent-runtime',)
+ DOCKER = ['/usr/bin/docker', '--host', 'unix:///var/run/docker.sock']
+ LOCK = Path('/run/lock/teaching-production-maintenance.lock')
+ RUN = Path('/run/teaching-production')
+@@ -168,10 +171,23 @@
+ def config(include_release=True):
+     return json.loads(run(compose_argv(include_release) + ['config', '--format', 'json']))
+ 
+-def validate_release(base, merged):
+-    if not RELEASE.exists():
+-        return
+-    candidate = json.loads(json.dumps(merged))
++def codex_module():
++    filename = ROOT / 'operations/release/codex_runtime.py'
++    safe_file(filename)
++    spec = importlib.util.spec_from_file_location('production_codex_runtime', filename)
++    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
++    return module
++
++def codex_context():
++    return types.SimpleNamespace(ROOT=ROOT, DOCKER=DOCKER, run=run, safe_file=safe_file)
++
++def service_names(merged=None):
++    merged = preflight() if merged is None else merged
++    extra = CODEX_SERVICES if set(merged['services']) & set(CODEX_SERVICES) else ()
++    return (*SERVICES, *extra)
++
++def validate_release(base, merged, approved_codex_settings=None):
++    candidate = codex_module().strip_release(codex_context(), base, merged, approved_codex_settings) if set(merged['services']) & set(CODEX_SERVICES) else json.loads(json.dumps(merged))
+     for name in ('api', *WORKERS):
+         image = candidate['services'][name]['image']
+         kind = 'api' if name == 'api' else 'worker'
+@@ -248,7 +264,7 @@
+ def preflight():
+     base = config(False); merged = config()
+     validate_release(base, merged)
+-    require(merged.get('name') == PROJECT and set(merged['services']) == set(SERVICES), 'COMPOSE_SCOPE_REFUSED')
++    require(merged.get('name') == PROJECT and set(merged['services']) == set(service_names(merged)), 'COMPOSE_SCOPE_REFUSED')
+     for name, service in merged['services'].items():
+         require(service.get('restart') == 'unless-stopped', 'PERSISTENT_RESTART_POLICY_REQUIRED')
+         if name in ('api', *WORKERS):
+@@ -299,17 +315,22 @@
+     return {'version': baseline['version'], 'baselineSourceSha': baseline['sourceSha'], 'currentSourceSha': None, 'healthy': False, 'bootstrapReady': True, 'configValid': True, 'phase': 'bootstrap', 'runningInfrastructureServices': sum(bool(x['State'].get('Running')) for x in containers.values()), 'businessServicesRunning': 0, 'workersEnabled': False, 'apiBackgroundEnabled': False, 'feedbackWritesEnabled': False}
+ 
+ def inspect():
++    merged = preflight(); expected = service_names(merged)
+     ids = run(DOCKER + ['ps', '-aq', '--filter', 'label=com.docker.compose.project=' + PROJECT]).decode().split()
+-    require(len(ids) == len(SERVICES), 'UNEXPECTED_CONTAINER_COUNT')
++    require(len(ids) == len(expected), 'UNEXPECTED_CONTAINER_COUNT')
+     containers = json.loads(run(DOCKER + ['inspect', *ids]))
+     found = {}
+     for container in containers:
+         labels = container['Config']['Labels']
+         require(labels.get('com.docker.compose.project') == PROJECT, 'CONTAINER_PROJECT_MISMATCH')
+         name = labels.get('com.docker.compose.service')
+-        require(name in SERVICES and name not in found and labels.get('com.docker.compose.oneoff') == 'False', 'CONTAINER_SERVICE_MISMATCH')
++        require(name in expected and name not in found and labels.get('com.docker.compose.oneoff') == 'False', 'CONTAINER_SERVICE_MISMATCH')
+         container_mount_scope(container, name)
++        if name in CODEX_SERVICES: codex_module().inspect_isolation(container, name, merged)
+         found[name] = container
++    if set(expected) & set(CODEX_SERVICES):
++        codex_module().inspect_networks(codex_context(), merged)
++        codex_module().inspect_api(found['api'], merged)
+     return found
+ 
+ def dependency_probe(api):
+@@ -317,9 +338,12 @@
+ 
+ def snapshot():
+     failures = []; containers = inspect(); services = {}
++    if (ROOT / 'operations/release/state/codex-configuration.pending.json').exists(): failures.append('CODEX_CONFIGURATION_PENDING')
++    marker = ROOT / 'operations/release/state/codex-host-install.pending.json'
++    if marker.exists() or marker.is_symlink(): failures.append('CODEX_HOST_INSTALLATION_PENDING')
+     for name, container in containers.items():
+         state = container['State']; health = state.get('Health', {}).get('Status')
+-        good = state.get('Running') is True and health not in ('unhealthy', 'starting') and not state.get('OOMKilled')
++        good = state.get('Running') is True and health not in ('unhealthy', 'starting') and not state.get('OOMKilled') and (name not in CODEX_SERVICES or health == 'healthy')
+         if not good: failures.append('SERVICE_' + name.upper().replace('-', '_'))
+         if container['HostConfig']['RestartPolicy']['Name'] != 'unless-stopped': failures.append('RESTART_POLICY_' + name.upper().replace('-', '_'))
+         services[name] = {'id': container['Id'][:12], 'state': state['Status'], 'health': health, 'restartPolicy': container['HostConfig']['RestartPolicy']['Name'], 'restartCount': container.get('RestartCount', 0), 'oomKilled': state.get('OOMKilled', False)}
+@@ -333,6 +357,13 @@
+             dependencies = dependency_probe(containers['api'])
+             if not dependencies.get('ok'): failures.append('DEPENDENCY_OR_CONSUMER')
+         except Exception: failures.append('DEPENDENCY_PROBE')
++    codex = None
++    if 'codex-agent-runtime' in containers:
++        try:
++            labels = containers['codex-agent-runtime']['Config'].get('Labels', {})
++            identity = dict(schemaVersion=1, protocol=labels.get('io.shukezhinao.codex.protocol'), sdkVersion=labels.get('io.shukezhinao.codex.sdk-version'))
++            codex = codex_module().probe(codex_context(), containers['api']['Id'], identity)
++        except Exception: failures.append('CODEX_PRIVATE_HEALTH')
+     http_checks = {}
+     for label, url in [('privateApi', 'http://127.0.0.1:28080/api/health'), ('websiteTls', 'https://shukezhinao.321weiqi.com/api/health'), ('apiTls', 'https://api-shukezhinao.321weiqi.com/health'), ('filesTls', 'https://files-shukezhinao.321weiqi.com/console')]:
+         args = ['/usr/bin/curl', '--silent', '--show-error', '--noproxy', '*', '--max-time', '6', '--output', '/dev/null', '--write-out', '%{http_code}']
+@@ -350,7 +381,7 @@
+     resources = {'memoryAvailableMiB': round(memory['MemAvailable'] / 1024, 1), 'swapUsedMiB': round((memory['SwapTotal'] - memory['SwapFree']) / 1024, 1), 'diskUsedPercent': round(disk.used * 100 / disk.total, 1), 'loadAverage': list(os.getloadavg())}
+     if resources['memoryAvailableMiB'] < 384: failures.append('LOW_MEMORY')
+     if resources['diskUsedPercent'] >= 90: failures.append('DISK_USAGE_HIGH')
+-    return {'checkedAt': utc(now()), 'healthy': not failures, 'failures': sorted(set(failures)), 'services': services, 'dependencies': dependencies, 'http': http_checks, 'resources': resources, 'externalNotifications': 0, 'modelCalls': 0, 'remediationActions': 0}
++    return {'checkedAt': utc(now()), 'healthy': not failures, 'failures': sorted(set(failures)), 'services': services, 'dependencies': dependencies, 'http': http_checks, 'resources': resources, 'externalNotifications': 0, 'modelCalls': 0, 'remediationActions': 0, **({'codex': codex} if 'codex-agent-runtime' in containers else {})}
+ 
+ def health_transition(previous, sample, suppressed):
+     old_alert = previous.get('alertActive') is True
+@@ -375,9 +406,12 @@
+     return 1 if state['alertActive'] and not state['maintenanceSuppressed'] else 0
+ 
+ def start_locked():
++    marker = ROOT / 'operations/release/state/codex-host-install.pending.json'
++    require(not (marker.exists() or marker.is_symlink()), 'CODEX_HOST_INSTALLATION_RECOVERY_REQUIRED')
+     require(fixed_env()['PRODUCTION_ACTIVATED'] == 'true', 'PRODUCTION_ACTIVATION_REQUIRED')
++    require(not (ROOT / 'operations/release/state/codex-configuration.pending.json').exists(), 'CODEX_CONFIGURATION_RECOVERY_REQUIRED')
+     preflight()
+-    run(compose_argv() + ['up', '-d', '--no-build', '--pull', 'never', '--no-recreate', '--wait', '--wait-timeout', '180', *SERVICES], timeout=240)
++    run(compose_argv() + ['up', '-d', '--no-build', '--pull', 'never', '--no-recreate', '--wait', '--wait-timeout', '180', *service_names()], timeout=240)
+     # --no-recreate preserves identities; live policy update also fixes a
+     # pre-operations worker container on a restored validation installation.
+     containers = inspect()
+@@ -404,15 +438,20 @@
+         finally:
+             recovered = start_locked()
+         after = inspect()
+-        require(all(before[name]['Id'] == after[name]['Id'] for name in SERVICES), 'UNEXPECTED_CONTAINER_RECREATION')
+-        require(all(before[name]['State']['StartedAt'] == after[name]['State']['StartedAt'] for name in SERVICES if name not in WORKERS), 'UNRELATED_SERVICE_RESTARTED')
+-        evidence = {'status': 'verified', 'checkedAt': utc(now()), 'stoppedWorkers': list(WORKERS) if stopped else [], 'containerIdentitiesPreserved': len(SERVICES), 'unrelatedServiceStartTimesUnchanged': 6, 'stoppedWorkersDetected': True, 'recoveredHealthy': recovered['healthy'], 'consumersAfter': recovered['dependencies']['consumers'], 'hostRebootPerformed': False, 'dockerDaemonRestarted': False, 'externalNotifications': 0, 'modelCalls': 0}
++        require(all(before[name]['Id'] == after[name]['Id'] for name in before), 'UNEXPECTED_CONTAINER_RECREATION')
++        require(all(before[name]['State']['StartedAt'] == after[name]['State']['StartedAt'] for name in before if name not in WORKERS), 'UNRELATED_SERVICE_RESTARTED')
++        evidence = {'status': 'verified', 'checkedAt': utc(now()), 'stoppedWorkers': list(WORKERS) if stopped else [], 'containerIdentitiesPreserved': len(before), 'unrelatedServiceStartTimesUnchanged': len(before) - len(WORKERS), 'stoppedWorkersDetected': True, 'recoveredHealthy': recovered['healthy'], 'consumersAfter': recovered['dependencies']['consumers'], 'hostRebootPerformed': False, 'dockerDaemonRestarted': False, 'externalNotifications': 0, 'modelCalls': 0}
+         atomic_json(OPS / 'recovery-receipt.json', evidence)
+         print(json.dumps(evidence))
+ 
+ def main():
+     require(len(sys.argv) >= 2, 'COMMAND_REQUIRED'); command = sys.argv[1]
+     fixed_env()
++    marker = ROOT / 'operations/release/state/codex-host-install.pending.json'
++    if marker.exists() or marker.is_symlink():
++        if command in ('health', 'status'):
++            print(json.dumps({'status': 'degraded', 'healthy': False, 'failures': ['CODEX_HOST_INSTALLATION_PENDING'], 'modelCalls': 0, 'externalNotifications': 0})); return 1
++        raise Refused('CODEX_HOST_INSTALLATION_RECOVERY_REQUIRED')
+     if command == 'compose':
+         args = sys.argv[2:]
+         require(bool(args) and not any(arg.split('=', 1)[0] in ('-f', '--file', '-p', '--project-name', '--project-directory', '--env-file', '--profile', '--context', '--host') for arg in args), 'COMPOSE_SCOPE_OVERRIDE_REFUSED')

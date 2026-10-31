@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import cnb_controller as controller
 import release_usage as usage
+from cnb_release import REGISTRY
 from test_cnb_release import fixture
 
 
@@ -81,8 +82,21 @@ class UsageTests(unittest.TestCase):
 
 
 class BuildAccountingTests(unittest.TestCase):
-    def invoke(self, initial, final=None, interrupt=False, lost_trigger=False):
+    def invoke(self, initial, final=None, interrupt=False, lost_trigger=False, four_images=False,
+               mismatch_runtime=False):
         calls, messages, result = [], [], usage.not_used()
+        runtime = {"schemaVersion": 1, "protocol": "teaching-codex-plan-v1", "sdkVersion": "0.165.0"} if four_images else None
+        receipt = fixture()
+        if runtime is not None:
+            receipt["schemaVersion"] = 3
+            receipt["runtime"] = runtime
+            receipt["images"]["codex-runtime"] = {
+                "ref": REGISTRY + "/codex-runtime@sha256:" + "e" * 64,
+                "id": "sha256:" + "f" * 64,
+            }
+            receipt["timings"]["codex-runtime"] = 1
+            if mismatch_runtime:
+                receipt["runtime"] = dict(runtime, sdkVersion="0.165.1")
         def api(token, method, path, value=None, **kwargs):
             calls.append((method, path, value, kwargs))
             if path == "":
@@ -98,11 +112,11 @@ class BuildAccountingTests(unittest.TestCase):
                     return final or initial
                 return initial
             if "/commit-annotations/" in path:
-                return [{"key": "tencent-" + "d" * 32, "value": json.dumps(fixture())}]
+                return [{"key": "tencent-" + "d" * 32, "value": json.dumps(receipt)}]
             return {}
         error = None
         with tempfile.TemporaryDirectory() as directory, patch.object(controller, "api", side_effect=api), \
-                patch.object(controller, "mirror", return_value=("c" * 40, "b" * 40)), \
+                patch.object(controller, "mirror", return_value=("c" * 40, "b" * 40, runtime)), \
                 patch.object(controller.uuid, "uuid4") as uuid, \
                 patch.object(controller.time, "sleep", side_effect=KeyboardInterrupt if interrupt else None):
             uuid.return_value.hex = "d" * 32
@@ -115,29 +129,45 @@ class BuildAccountingTests(unittest.TestCase):
         return result, calls, error
 
     def test_success_and_failure_both_record_actual_cost_without_extra_poll(self):
-        for status in ("success", "error"):
-            result, calls, error = self.invoke(state(status))
-            self.assertEqual(result["coreHours"], 0.21)
-            self.assertEqual(result["basis"], "reported")
-            self.assertEqual(len([c for c in calls if "/status/" in c[1]]), 1)
-            self.assertEqual(next(c[2]["title"] for c in calls if c[1].endswith("/start")),
-                             "Tencent Production 0.0.126 [GitHub 12345/2]")
-            self.assertEqual(error is None, status == "success")
+        for four_images in (False, True):
+            for status in ("success", "error"):
+                with self.subTest(four_images=four_images, status=status):
+                    result, calls, error = self.invoke(state(status), four_images=four_images)
+                    self.assertEqual(result["coreHours"], 0.21)
+                    self.assertEqual(result["basis"], "reported")
+                    self.assertEqual(len([c for c in calls if "/status/" in c[1]]), 1)
+                    self.assertEqual(next(c[2]["title"] for c in calls if c[1].endswith("/start")),
+                                     "Tencent Production 0.0.126 [GitHub 12345/2]")
+                    self.assertEqual(error is None, status == "success")
 
     def test_cancellation_stops_first_then_reads_accounting_once(self):
-        result, calls, error = self.invoke(state("running"), state("cancel", metricCoreHours=0.1), interrupt=True)
-        self.assertIsInstance(error, KeyboardInterrupt)
-        self.assertEqual(result["coreHours"], 0.1)
-        self.assertEqual(calls[-2][0:2], ("POST", "/-/build/stop/fixture-build"))
-        self.assertEqual(calls[-1][3], {"timeout": 10})
+        for four_images in (False, True):
+            with self.subTest(four_images=four_images):
+                result, calls, error = self.invoke(state("running"), state("cancel", metricCoreHours=0.1), interrupt=True, four_images=four_images)
+                self.assertIsInstance(error, KeyboardInterrupt)
+                self.assertEqual(result["coreHours"], 0.1)
+                self.assertEqual(calls[-2][0:2], ("POST", "/-/build/stop/fixture-build"))
+                self.assertEqual(calls[-1][3], {"timeout": 10})
+
+    def test_four_image_receipt_mismatch_retains_actual_usage_and_failure(self):
+        result, calls, error = self.invoke(state("success"), four_images=True, mismatch_runtime=True)
+        self.assertIsInstance(error, ValueError)
+        self.assertEqual(str(error), "CNB source tree mismatch")
+        self.assertEqual(result["basis"], "reported")
+        self.assertEqual(result["coreHours"], 0.21)
+        self.assertEqual(len([c for c in calls if "/status/" in c[1]]), 1)
 
     def test_accounting_error_preserves_release_failure_and_marks_pending(self):
-        result, calls, error = self.invoke(state("error", metricCoreHours=None, metricDuration=None), RuntimeError("SECRET"))
-        self.assertIsInstance(error, ValueError)
-        self.assertEqual(str(error), "CNB build failed")
-        self.assertEqual(result["basis"], "pending")
+        for four_images in (False, True):
+            with self.subTest(four_images=four_images):
+                result, calls, error = self.invoke(state("error", metricCoreHours=None, metricDuration=None), RuntimeError("SECRET"), four_images=four_images)
+                self.assertIsInstance(error, ValueError)
+                self.assertEqual(str(error), "CNB build failed")
+                self.assertEqual(result["basis"], "pending")
 
     def test_uncertain_trigger_is_not_reported_as_zero_usage(self):
-        result, calls, error = self.invoke(None, lost_trigger=True)
-        self.assertIsInstance(error, TimeoutError)
-        self.assertEqual(result["basis"], "pending")
+        for four_images in (False, True):
+            with self.subTest(four_images=four_images):
+                result, calls, error = self.invoke(None, lost_trigger=True, four_images=four_images)
+                self.assertIsInstance(error, TimeoutError)
+                self.assertEqual(result["basis"], "pending")

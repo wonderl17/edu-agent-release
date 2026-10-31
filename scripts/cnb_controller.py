@@ -9,7 +9,7 @@ import time
 import uuid
 from urllib.request import Request, urlopen
 
-from cnb_release import REPO, SOURCE, SHA, canonical, validate_manifest
+from cnb_release import REPO, SOURCE, SHA, canonical, validate_manifest, source_runtime, RUNTIME_FILES
 from release_usage import from_status, pending
 
 
@@ -31,6 +31,16 @@ def mirror(source, sha, version, private, child, log, token, run):
     target = private / "cnb-source"
     target.mkdir(mode=0o700)
     source_tree = run(["git", "rev-parse", sha + "^{tree}"], child, log, cwd=source, capture=True).decode().strip()
+    entries = run(["git", "ls-tree", "-z", sha, "--", *RUNTIME_FILES], child, log, cwd=source, capture=True).decode().split('\0')
+    files = {}
+    for entry in filter(None, entries):
+        identity, name = entry.split('\t', 1)
+        mode, kind, oid = identity.split()
+        if name not in RUNTIME_FILES or mode not in ('100644', '100755') or kind != 'blob' or not SHA.fullmatch(oid):
+            raise ValueError("runtime source entry")
+        files[name] = oid
+    runtime = source_runtime(lambda name: run(["git", "cat-file", "blob", files[name]], child, log,
+                                              cwd=source, capture=True) if name in files else None)
     objects = run(["git", "rev-parse", "--path-format=absolute", "--git-path", "objects"], child, log, cwd=source, capture=True).decode().strip()
     auth = base64.b64encode(("cnb:" + token).encode()).decode()
     git_env = dict(child, GIT_ALTERNATE_OBJECT_DIRECTORIES=objects, GIT_CONFIG_COUNT="3",
@@ -66,7 +76,7 @@ def mirror(source, sha, version, private, child, log, token, run):
     if git("rev-parse", "HEAD:source", capture=True).decode().strip() != source_tree:
         raise ValueError("source tree altered")
     git("push", "--quiet", "origin", "HEAD:refs/heads/main")
-    return snapshot, source_tree
+    return snapshot, source_tree, runtime
 
 
 def verify_access(token):
@@ -87,7 +97,7 @@ def build(source, sha, version, private, child, log, token, run, status, usage=N
     verify_access(token)
     started = time.monotonic()
     status("Tencent Production: synchronizing validated source to private CNB.")
-    snapshot, source_tree = mirror(source, sha, version, private, child, log, token, run)
+    snapshot, source_tree, runtime = mirror(source, sha, version, private, child, log, token, run)
     request_id = uuid.uuid4().hex
     if usage is not None:
         # A lost trigger response may still have started a billable build.
@@ -127,7 +137,7 @@ def build(source, sha, version, private, child, log, token, run, status, usage=N
         if len(values) != 1:
             raise ValueError("CNB receipt missing")
         manifest = validate_manifest(json.loads(values[0]), sha, version, snapshot, request_id)
-        if manifest["sourceTree"] != source_tree:
+        if manifest["sourceTree"] != source_tree or manifest.get("runtime") != runtime:
             raise ValueError("CNB source tree mismatch")
         path = private / "registry-manifest.json"
         path.write_bytes(canonical(manifest))

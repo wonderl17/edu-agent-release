@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 
 from release_auth import github_request, installation_token, stop_process
 from cnb_controller import build as build_cnb, verify_access as verify_cnb_access
+from cnb_release import RUNTIME_FILES
 from release_usage import not_used, report as report_usage
 
 SOURCE = "shukezhinao/edu-agent"
@@ -39,6 +40,19 @@ VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 class Failure(Exception):
     def __init__(self, code):
         self.code = code
+
+
+class UnsupportedBuildBackend(Failure):
+    """A source/backend combination refused before recording a release attempt."""
+
+
+def require_supported_build_backend(backend, source):
+    if backend not in ("cnb", "cos"):
+        raise UnsupportedBuildBackend(40)
+    marker = Path(source) / RUNTIME_FILES[0]
+    if backend == "cos" and (marker.exists() or marker.is_symlink()):
+        status("Tencent Production: COS builds do not support the required Codex runtime image.")
+        raise UnsupportedBuildBackend(40)
 
 
 def status(message):
@@ -360,6 +374,8 @@ def saved_config_ids(path, images, sha):
 
 
 def build_bundle(source, sha, version, private, child, log):
+    # Also enforce at the builder boundary if a future caller bypasses execute.
+    require_supported_build_backend("cos", source)
     prepare_build_disk(private, child, log)
     status("Tencent Production: checking changelog.")
     # Dependency hooks and private scripts execute behind a mount/PID boundary.
@@ -467,8 +483,15 @@ def execute(env):
                     version = json.loads((source / "package.json").read_text())["version"]
                     version_tuple(version)
                     report_version = version
+                    # The legacy COS bundle contains only the three original
+                    # images. Reject an opted-in source before recording an
+                    # attempt or creating any deployment/transfer. Resume
+                    # must continue to use its already-bound original package.
+                    backend = env.get("TENCENT_BUILD_BACKEND") or "cnb"
+                    if operation != "resume":
+                        require_supported_build_backend(backend, source)
                     if operation == "verify":
-                        if (env.get("TENCENT_BUILD_BACKEND") or "cnb") == "cnb":
+                        if backend == "cnb":
                             status("Tencent Production: checking private CNB access.")
                             verify_cnb_access(env.get("TENCENT_CNB_TOKEN", ""))
                         status("Tencent Production: verification complete; no deployment.")
@@ -513,7 +536,6 @@ def execute(env):
                             raise Failure(47)
                         identity = ticket["transferTicket"]
                     else:
-                        backend = env.get("TENCENT_BUILD_BACKEND") or "cnb"
                         if backend == "cnb":
                             bundle = build_cnb(source, sha, version, private, child, log,
                                                env.get("TENCENT_CNB_TOKEN", ""), run, status, usage=usage,
@@ -579,7 +601,7 @@ def execute(env):
                 except BaseException as error:
                     if isinstance(error, (SystemExit, KeyboardInterrupt)):
                         outcome = "cancelled"
-                    if operation != "verify" and not isinstance(error, (SystemExit, KeyboardInterrupt)):
+                    if operation != "verify" and not isinstance(error, (SystemExit, KeyboardInterrupt, UnsupportedBuildBackend)):
                         try:
                             log.flush()
                             log.seek(max(0, log.seek(0, os.SEEK_END) - 128 * 1024))
