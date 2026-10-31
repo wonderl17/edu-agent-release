@@ -205,7 +205,45 @@ def ssh_configuration(env, private):
     private_file(known, (hosts.strip() + "\n").encode())
     return ["ssh", "-F", "/dev/null", "-T", "-i", str(keypath), "-o", "IdentitiesOnly=yes",
             "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o",
-            "UserKnownHostsFile=" + str(known), "-o", "ConnectTimeout=20", f"{USER}@{HOST}"]
+            "UserKnownHostsFile=" + str(known), "-o", "ConnectTimeout=20",
+            "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3", f"{USER}@{HOST}"]
+
+
+# Only fixed receiver failure categories are allowed into public Actions output
+# or uploaded diagnostics. Never forward arbitrary receiver JSON or stdout.
+RECEIVER_FAILURE_CODES = frozenset({
+    "RECEIVER_FAILED", "PRIVATE_COMMAND_FAILED", "CLIENT_DISCONNECTED", "CLIENT_CANCELLED",
+    "REGISTRY_MANIFEST_REFUSED", "REGISTRY_MANIFEST_HASH_MISMATCH", "REGISTRY_AUTH_DIRECTORY_UNSAFE",
+    "REGISTRY_IMAGE_IDENTITY_MISMATCH", "REGISTRY_MANIFEST_CONTENT_MISMATCH",
+    "REGISTRY_CONFIG_DIGEST_MISMATCH", "REGISTRY_CONFIG_CONTENT_MISMATCH",
+    "REGISTRY_CONFIG_IDENTITY_MISMATCH", "REGISTRY_RUNTIME_CONFIG_MISMATCH",
+    "REGISTRY_RUNTIME_PACKAGE_MISMATCH", "INSUFFICIENT_RELEASE_DISK", "VERSION_REGRESSION_REFUSED",
+    "SAME_VERSION_CURRENT_SOURCE_CHANGED", "VERSION_SOURCE_COLLISION", "RELEASE_DIRECTORY_COLLISION",
+    "TRANSFER_TICKET_NOT_FOUND", "TRANSFER_TICKET_ALREADY_USED", "TRANSFER_TICKET_EXPIRED",
+    "TRANSFER_TICKET_IDENTITY_MISMATCH", "STAGE_RELAY_REQUIRED", "WEB_VERSION_MISMATCH",
+    "WEB_HTTP_ASSET_MISSING", "WEB_TREE_UNSAFE", "WEB_EXPANSION_LIMIT", "WEB_CONTAINER_INVALID",
+    "CODEX_HOST_INSTALLATION_RECOVERY_REQUIRED", "CODEX_CONFIGURATION_RECOVERY_REQUIRED",
+    "DEPLOY_FAILED_ROLLBACK_RESTORED", "DEPLOY_FAILED_ROLLBACK_INCOMPLETE",
+})
+RECEIVER_FAILURE_PHASES = frozenset({
+    "protocol", "stage-registry-pull", "stage-relay-download", "stage-validate", "stage-load-images",
+    "validate-artifacts", "maintenance", "migration", "activate", "verify", "rollback",
+})
+
+
+def receiver_failure(output):
+    try:
+        value = json.loads(output)
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+    if not isinstance(value, dict) or value.get("status") != "failed":
+        return None
+    code, phase = value.get("code"), value.get("phase")
+    if not isinstance(code, str) or code not in RECEIVER_FAILURE_CODES:
+        return None
+    if not isinstance(phase, str) or phase not in RECEIVER_FAILURE_PHASES:
+        return None
+    return code, phase
 
 
 def read_with_open_input(process, timeout=5400):
@@ -256,6 +294,11 @@ def remote(ssh, child, log, request, payload=None):
             output, _ = process.communicate(timeout=5400)
         if process.returncode or len(output) > 128 * 1024:
             if process.returncode:
+                failure = receiver_failure(output) if len(output) <= 128 * 1024 else None
+                if failure:
+                    message = "Tencent Production: receiver refused (" + failure[0] + ", " + failure[1] + ")."
+                    status(message)
+                    log.write((message + "\n").encode())
                 log.flush()
                 end = log.seek(0, os.SEEK_END)
                 log.seek(max(log_start, end - 128 * 1024))

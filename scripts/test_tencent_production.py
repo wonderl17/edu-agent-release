@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import tarfile
 import unittest
@@ -308,12 +309,43 @@ class ProductionBoundaryTests(unittest.TestCase):
             args = target.ssh_configuration(env, root)
             self.assertIn("StrictHostKeyChecking=yes", args)
             self.assertIn("IdentitiesOnly=yes", args)
+            self.assertIn("ServerAliveInterval=30", args)
+            self.assertIn("ServerAliveCountMax=3", args)
             self.assertEqual(args[-1], target.USER + "@" + target.HOST)
             self.assertEqual((root / "deploy.key").stat().st_mode & 0o777, 0o600)
             self.assertTrue((root / "deploy.key").read_bytes().endswith(b"\n"))
+            # -G only renders OpenSSH's effective configuration; it does not connect.
+            result = subprocess.run([args[0], "-G", *args[1:]], capture_output=True, text=True, check=True)
+            self.assertIn("serveraliveinterval 30\n", result.stdout)
+            self.assertIn("serveralivecountmax 3\n", result.stdout)
         for host in ("*", "shukezhinao.321weiqi.com", "49.233.166.202,other"):
             with tempfile.TemporaryDirectory() as directory, self.assertRaises(target.Failure):
                 target.ssh_configuration(dict(env, TENCENT_PRODUCTION_SSH_KNOWN_HOSTS=host + " ssh-ed25519 AA"), Path(directory))
+
+    def test_nonzero_receiver_response_reports_only_fixed_safe_codes(self):
+        class Process:
+            def __init__(self):
+                self.stdin = io.BytesIO()
+                self.returncode = 1
+
+        samples = [
+            ({"status": "failed", "code": "PRIVATE_COMMAND_FAILED", "phase": "stage-registry-pull", "detail": "SECRET_SENTINEL"}, True),
+            ({"status": "failed", "code": "SECRET_SENTINEL", "phase": "stage-registry-pull"}, False),
+            ({"status": "failed", "code": "PRIVATE_COMMAND_FAILED", "phase": "SECRET_SENTINEL"}, False),
+        ]
+        for body, recognized in samples:
+            with self.subTest(recognized=recognized, body=body):
+                output, log = io.StringIO(), io.BytesIO()
+                payload = json.dumps(body).encode()
+                with patch.object(target.subprocess, "Popen", return_value=Process()), \
+                     patch.object(target, "read_with_open_input", return_value=payload), \
+                     patch.object(target, "stop_process"), \
+                     patch("sys.stdout", output), self.assertRaises(target.Failure) as caught:
+                    target.remote([], {}, log, {"action": "stage"})
+                self.assertEqual(caught.exception.code, 44)
+                visible = output.getvalue() + log.getvalue().decode()
+                self.assertNotIn("SECRET_SENTINEL", visible)
+                self.assertEqual("PRIVATE_COMMAND_FAILED" in visible, recognized)
 
     def test_source_history_check_precedes_checkout_and_token_stays_in_environment(self):
         calls = []
