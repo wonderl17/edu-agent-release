@@ -18,6 +18,12 @@ class OriginalPackageResumeTests(unittest.TestCase):
     BUNDLE_HASH = "f" * 64
     PRIVATE_SENTINEL = "SYNTHETIC_PRIVATE_SENTINEL_MUST_STAY_PRIVATE"
 
+    def test_workflow_keeps_ticket_out_of_dispatch_and_non_resume_operations(self):
+        workflow = (Path(__file__).resolve().parent.parent / ".github/workflows/tencent-production.yml").read_text()
+        self.assertNotIn("previous_transfer_ticket:", workflow)
+        self.assertNotIn("inputs.previous_transfer_ticket", workflow)
+        self.assertIn("inputs.operation == 'resume' && secrets.TENCENT_PRODUCTION_PREVIOUS_TRANSFER_TICKET || ''", workflow)
+
     def execute_fixture(self, *, healthy=True, resume_result=None, cancelled=False):
         events, remote_calls, git_calls, source_paths = [], [], [], []
         stdout = io.StringIO()
