@@ -482,9 +482,31 @@ def receipt_time(receipt,key):
  except Exception:raise Refused('RELEASE_RECEIPT_ORDER_UNCERTAIN')
  require(moment.tzinfo is not None,'RELEASE_RECEIPT_ORDER_UNCERTAIN');return moment
 
+def restored_legacy_drain_failure(record,identity):
+ # Old receivers recorded source-level failures without package hashes. Only
+ # their complete, confirmed pre-migration drain rollback can be reconciled.
+ fields={'status','code','causeCode','rollbackCauseCode','phase','sourceSha','version','snapshotId',
+         'configurationRollbackSucceeded','databaseAutomaticallyRestored','migrationStarted',
+         'migrationSucceeded','manualDatabaseReviewRequired','failedAt'}
+ if not isinstance(record,dict)or set(record)!=fields:return False
+ if not(all(record.get(key)==identity[key]for key in('sourceSha','version'))and
+        record['status']=='failed'and record['code']=='DEPLOY_FAILED_ROLLBACK_RESTORED'and
+        record['causeCode']in('CLIENT_DISCONNECTED','API_DRAIN_CONNECTION_TIMEOUT')and record['phase']=='drain'and
+        record['rollbackCauseCode']is None and record['snapshotId']is None and
+        record['configurationRollbackSucceeded']is True and record['databaseAutomaticallyRestored']is False and
+        record['migrationStarted']is False and record['migrationSucceeded']is False and
+        record['manualDatabaseReviewRequired']is False):return False
+ try:receipt_time(record,'failedAt')
+ except Refused:return False
+ return True
+
 def newest_receipt(local,global_record,identity,time_key):
  if global_record is not None and all(global_record.get(key)==identity[key]for key in('sourceSha','version')):
-  require(all(key in global_record for key in identity),'RELEASE_RECEIPT_IDENTITY_MISSING')
+  if not all(key in global_record for key in identity):
+   require(time_key=='failedAt'and restored_legacy_drain_failure(global_record,identity),'RELEASE_RECEIPT_IDENTITY_MISSING')
+   # This is still a failure, never a package success. Do not let an unbound
+   # source-level record hide any package-specific failure or migration review.
+   return local if local is not None else global_record
   if all(global_record.get(key)==value for key,value in identity.items()):
    if local is None or receipt_time(global_record,time_key)>receipt_time(local,time_key):return global_record
  return local
@@ -519,7 +541,8 @@ def release_status(h):
  receipt=newest_receipt(receipt,optional_record(STATE/'last-success.json'),identity,'deployedAt')
  failure=optional_record(target/'failure-receipt.json')
  if failure is not None:
-  require(all(failure.get(key)==value for key,value in identity.items()),'RELEASE_RECEIPT_IDENTITY_MISMATCH')
+  require(all(failure.get(key)==value for key,value in identity.items())or restored_legacy_drain_failure(failure,identity),
+          'RELEASE_RECEIPT_IDENTITY_MISMATCH')
  failure=newest_receipt(failure,optional_record(STATE/'last-failure.json'),identity,'failedAt')
  if failure is not None and(receipt is None or receipt_time(failure,'failedAt')>=receipt_time(receipt,'deployedAt')):
   return{**result,'state':'failed','recoveryRequired':failure.get('configurationRollbackSucceeded')is not True or

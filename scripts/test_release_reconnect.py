@@ -1,5 +1,7 @@
 """Offline fault injection at the receiver boundary; no Docker or SSH calls."""
 import importlib.util
+import copy
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -8,6 +10,9 @@ import tempfile
 import types
 import unittest
 from unittest.mock import patch
+
+import cnb_release as contract
+import tencent_registry as registry
 
 
 def load():
@@ -55,6 +60,15 @@ class ReleaseReconnectTests(unittest.TestCase):
     def runtime(self):
         return patch.multiple(self.r,current=lambda:({'version':self.identity['version'],'buildSha':self.identity['sourceSha']},self.containers),
                               command=lambda *args,**kwargs:json.dumps({'version':self.identity['version'],'buildSha':self.identity['sourceSha']}).encode())
+
+    def legacy_failure(self, **changes):
+        # Synthetic values with the complete pre-package-identity schema.
+        value=dict(status='failed', code='DEPLOY_FAILED_ROLLBACK_RESTORED', causeCode='CLIENT_DISCONNECTED',
+                    rollbackCauseCode=None, phase='drain', sourceSha=self.identity['sourceSha'], version=self.identity['version'],
+                    snapshotId=None, configurationRollbackSucceeded=True, databaseAutomaticallyRestored=False,
+                    migrationStarted=False, migrationSucceeded=False, manualDatabaseReviewRequired=False,
+                    failedAt='2026-11-01T14:00:00Z')
+        value.update(changes);return value
 
     def test_readonly_protocol_accepts_ticket_or_explicit_identity_and_rejects_ambiguity(self):
         for h in(self.bound_ticket(),dict(self.identity,action='release-status')):
@@ -147,6 +161,101 @@ class ReleaseReconnectTests(unittest.TestCase):
         self.write(self.r.STATE/'last-failure.json',{'sourceSha':self.identity['sourceSha'],'version':self.identity['version'],
                                                   'manualDatabaseReviewRequired':True})
         with self.assertRaisesRegex(self.r.Refused,'RELEASE_RECEIPT_IDENTITY_MISSING'):self.status()
+
+    def test_complete_legacy_cancelled_deploy_reports_restored_failure_without_stage_or_rewriting_identity(self):
+        for locations in (('global',), ('package',), ('global', 'package')):
+            with self.subTest(locations=locations):
+                for path in (self.r.STATE/'last-failure.json', self.target/'failure-receipt.json'):
+                    path.unlink(missing_ok=True)
+                failure=self.legacy_failure()
+                paths=[self.r.STATE/'last-failure.json' if place=='global' else self.target/'failure-receipt.json' for place in locations]
+                for path in paths:self.write(path,failure)
+                before={path:path.read_bytes()for path in paths}
+                value=self.status(self.bound_ticket())
+                self.assertEqual(value,dict(status='release_status',**self.identity,state='failed',recoveryRequired=False))
+                self.assertEqual(before,{path:path.read_bytes()for path in paths})
+                self.assertFalse((self.target/'stage-receipt.json').exists())
+                self.assertFalse((self.target/'deployment-receipt.json').exists())
+
+    def test_complete_legacy_idle_timeout_is_a_restored_failure_not_a_success(self):
+        self.write(self.target/'failure-receipt.json',self.legacy_failure(causeCode='API_DRAIN_CONNECTION_TIMEOUT'))
+        value=self.status(self.bound_ticket())
+        self.assertEqual((value['state'],value['recoveryRequired']),('failed',False))
+        self.assertNotIn('verification',value)
+
+    def test_legacy_failure_requires_every_field_and_refuses_unsafe_or_partial_identity(self):
+        failure=self.legacy_failure()
+        for key in failure:
+            with self.subTest(missing=key):
+                value=dict(failure);value.pop(key)
+                self.assertFalse(self.r.restored_legacy_drain_failure(value,self.identity))
+                if key not in ('sourceSha','version'):
+                    self.write(self.r.STATE/'last-failure.json',value)
+                    with self.assertRaisesRegex(self.r.Refused,'RELEASE_RECEIPT_IDENTITY_MISSING'):self.status()
+        for fields in ({'status':'deployed'}, {'code':'DEPLOY_FAILED_ROLLBACK_INCOMPLETE'}, {'causeCode':'API_DRAIN_STOP_UNCERTAIN'},
+                       {'phase':'migration'}, {'phase':'worker-stop'}, {'migrationStarted':True}, {'migrationSucceeded':True},
+                       {'manualDatabaseReviewRequired':True}, {'configurationRollbackSucceeded':False}, {'rollbackCauseCode':'UNKNOWN'},
+                       {'databaseAutomaticallyRestored':True}, {'snapshotId':'unknown'}, {'failedAt':'invalid'},
+                       {'configurationRollbackSucceeded':1}, {'migrationStarted':0}, {'bundleBytes':321}, {'bundleSha256':'b'*64}):
+            with self.subTest(fields=fields):
+                value=dict(failure,**fields)
+                self.assertFalse(self.r.restored_legacy_drain_failure(value,self.identity))
+                self.write(self.r.STATE/'last-failure.json',value)
+                with self.assertRaises(self.r.Refused):self.status()
+        for fields in ({'sourceSha':'f'*40}, {'version':'0.0.135'}):
+            self.assertFalse(self.r.restored_legacy_drain_failure(dict(failure,**fields),self.identity))
+            request=dict(self.bound_ticket(),**fields)
+            with self.assertRaisesRegex(self.r.Refused,'TRANSFER_TICKET_IDENTITY_MISMATCH'):self.status(request)
+
+    def test_unsafe_legacy_package_failure_cannot_be_rescued_by_a_safe_global_record(self):
+        self.write(self.r.STATE/'last-failure.json',self.legacy_failure())
+        for fields in ({'phase':'migration'}, {'migrationStarted':True}, {'configurationRollbackSucceeded':False},
+                       {'sourceSha':'f'*40}, {'version':'9.2.2'}, {'bundleBytes':321}):
+            with self.subTest(fields=fields):
+                self.write(self.target/'failure-receipt.json',self.legacy_failure(**fields))
+                with self.assertRaisesRegex(self.r.Refused,'RELEASE_RECEIPT_IDENTITY_MISMATCH'):self.status()
+
+    def test_safe_legacy_failure_never_masks_package_migration_failure_or_legacy_success(self):
+        self.write(self.target/'failure-receipt.json',dict(self.identity,configurationRollbackSucceeded=True,
+                   manualDatabaseReviewRequired=True,failedAt='2026-11-01T01:00:00Z'))
+        self.write(self.r.STATE/'last-failure.json',self.legacy_failure())
+        self.assertTrue(self.status()['recoveryRequired'])
+        (self.target/'failure-receipt.json').unlink()
+        legacy=dict(self.receipt);legacy.pop('bundleBytes');legacy.pop('bundleSha256')
+        self.write(self.r.STATE/'last-success.json',legacy)
+        with self.assertRaisesRegex(self.r.Refused,'RELEASE_RECEIPT_IDENTITY_MISSING'):self.status()
+
+    def test_restored_legacy_deploy_can_prepare_registry_resume_with_the_exact_original_manifest(self):
+        manifest=dict(schemaVersion=3,deployment='teaching-production',sourceRepository=self.r.SOURCE,
+                      sourceSha=self.identity['sourceSha'],sourceTree='1'*40,snapshotSha='2'*40,requestId='3'*32,
+                      version=self.identity['version'],runtime=dict(schemaVersion=1,protocol='teaching-codex-plan-v1',sdkVersion='0.165.0'),
+                      timings=dict(api=1,worker=1,web=1,**{'codex-runtime':1,'total':4}),
+                      images={kind:dict(ref=contract.REGISTRY+'/'+kind+'@sha256:'+'4'*64,id='sha256:'+'5'*64)
+                              for kind in ('api','worker','web','codex-runtime')})
+        raw=contract.canonical(manifest)
+        self.identity.update(bundleBytes=len(raw),bundleSha256=hashlib.sha256(raw).hexdigest())
+        self.target=self.r.RELEASES/self.identity['sourceSha']/self.identity['bundleSha256']
+        request=self.bound_ticket();path=self.r.OPS/'transfers'/(self.ticket+'.json')
+        record=json.loads(path.read_text());record.update(transport='registry',registryManifest=manifest);self.write(path,record)
+        self.write(self.r.STATE/'last-failure.json',self.legacy_failure())
+        self.write(self.target/'failure-receipt.json',self.legacy_failure())
+        self.assertEqual((self.status(request)['state'],self.status(request)['recoveryRequired']),('failed',False))
+        self.r.ops.fixed_env=lambda:{'PRODUCTION_ACTIVATED':'true'}
+        context=types.SimpleNamespace(ops=self.r.ops,Refused=self.r.Refused,require=self.r.require,atomic=self.write,OPS=self.r.OPS)
+        resume=dict(action='resume-transfer',sourceRepository=self.r.SOURCE,sourceSha=self.identity['sourceSha'],
+                    version=self.identity['version'],previousTransferTicket=self.ticket)
+        with patch.object(self.r,'current',return_value=({'version':'0.0.133','buildSha':'6'*40},{})),\
+             patch.object(self.r,'registry_handler',return_value=(registry,context)):
+            value=self.r.resume_transfer(resume)
+            self.assertEqual(value['status'],'transfer_resumed')
+            fresh=json.loads((self.r.OPS/'transfers'/(value['transferTicket']+'.json')).read_text())
+            self.assertEqual(fresh['registryManifest'],manifest);self.assertFalse(fresh['used'])
+            self.assertEqual((fresh['bundleBytes'],fresh['bundleSha256']),(len(raw),hashlib.sha256(raw).hexdigest()))
+            self.assertTrue(json.loads(path.read_text())['used'])
+            bad=copy.deepcopy(record);bad['registryManifest']['timings']['api']=2;self.write(path,bad)
+            with self.assertRaisesRegex(self.r.Refused,'REGISTRY_MANIFEST_HASH_MISMATCH'):self.r.resume_transfer(resume)
+            self.write(path,dict(record,sourceSha='f'*40))
+            with self.assertRaisesRegex(self.r.Refused,'TRANSFER_TICKET_IDENTITY_MISMATCH'):self.r.resume_transfer(resume)
 
     def test_newer_migration_failure_overrides_stale_success_but_later_success_can_finish(self):
         failure=dict(self.identity,configurationRollbackSucceeded=True,manualDatabaseReviewRequired=True,failedAt='2026-11-01T02:00:00Z')
