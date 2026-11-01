@@ -243,11 +243,14 @@ RECEIVER_FAILURE_CODES = frozenset({
     "CURRENT_WEB_MOUNT_REFUSED", "RUNNING_CODEX_IMAGE_ID_MISMATCH", "PUBLIC_WEB_VERSION_MISMATCH",
     "RELEASE_STATUS_RECORD_INVALID",
     "RELEASE_RECEIPT_ORDER_UNCERTAIN",
+    "API_SHUTDOWN_ACCEPTANCE_FAILED", "API_SHUTDOWN_ACCEPTANCE_MISMATCH",
+    "API_SHUTDOWN_ACCEPTANCE_INCOMPLETE", "API_SHUTDOWN_ACCEPTANCE_PATH_UNSAFE",
+    "API_SHUTDOWN_IMAGE_REFERENCE_REQUIRED", "API_SHUTDOWN_ACCEPTANCE_PRODUCTION_CHANGED",
 })
 RECEIVER_FAILURE_PHASES = frozenset({
     "protocol", "stage-registry-pull", "stage-relay-download", "stage-validate", "stage-load-images",
     "validate-artifacts", "maintenance", "migration", "activate", "verify", "rollback",
-    "candidate-preflight", "drain", "worker-stop", "release-status",
+    "candidate-preflight", "api-shutdown-acceptance", "drain", "worker-stop", "release-status",
     "receive", "registry-pull", "relay-download", "load-images",
 })
 RECEIVER_CAUSE_CODES = RECEIVER_FAILURE_CODES | frozenset({

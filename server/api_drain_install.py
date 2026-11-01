@@ -25,6 +25,7 @@ FILES = {
     RECEIVER: 'receiver.py',
     'operations/release/api_drain.py': 'api_drain.py',
     'operations/release/codex_configure.py': 'codex_configure.py',
+    'operations/release/api_image_shutdown.py': 'api_image_shutdown.py',
 }
 PENDING = 'operations/release/state/api-drain-install.pending.json'
 ROLLBACK_READY = 'operations/release/state/api-drain-install.rollback-ready.json'
@@ -184,7 +185,8 @@ class Installer:
                                for name, item in containers.items()}}
 
     def control_command(self, args, runtime):
-        sensitive = (RECEIVER, 'operations/release/codex_configure.py', OPS)
+        sensitive = (RECEIVER, 'operations/release/codex_configure.py',
+                     'operations/release/api_image_shutdown.py', OPS)
         if any(str(self.root / name) in value for name in sensitive for value in args): return True
         if not any(Path(value).name in ('docker', 'docker-compose') for value in args[:2]): return False
         containers = runtime['containers']

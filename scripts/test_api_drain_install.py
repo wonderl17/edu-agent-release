@@ -28,7 +28,7 @@ class Fixture:
         self.before = {}
         self.after = {}
         for name in m.FILES:
-            data = None if name.endswith('/api_drain.py') else ('# old ' + name + '\n').encode()
+            data = None if name.endswith(('/api_drain.py', '/api_image_shutdown.py')) else ('# old ' + name + '\n').encode()
             self.before[name] = data
             self.after[name] = ('# reviewed ' + name + '\n').encode()
             if data is not None:
@@ -131,6 +131,7 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(inst.control_command(['/usr/bin/docker', 'stop', 'a' * 12], runtime))
         self.assertTrue(inst.control_command(['/usr/bin/docker', 'exec', 'teaching-production-api-1', 'node'], runtime))
         self.assertTrue(inst.control_command(['/usr/bin/python3', '-c', 'load(' + str(self.f.root / m.RECEIVER) + ')'], runtime))
+        self.assertTrue(inst.control_command(['/usr/bin/python3', '-I', str(self.f.root / 'operations/release/api_image_shutdown.py')], runtime))
         self.assertFalse(inst.control_command(['/usr/bin/docker', 'stop', 'c' * 64], runtime))
 
     def test_exclusive_control_lock_refuses_without_creating_journal(self):

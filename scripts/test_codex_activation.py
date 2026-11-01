@@ -277,6 +277,10 @@ class ActivationTests(unittest.TestCase):
                 events.append('candidate')
                 if fail=='candidate':raise receiver.Refused('CANDIDATE_REFUSED')
                 return copy.deepcopy(expected)
+            def acceptance(*args):
+                events.append('shutdown-acceptance')
+                if fail=='shutdown-acceptance':raise receiver.Refused('API_SHUTDOWN_ACCEPTANCE_FAILED')
+                return dict(status='passed')
             def migration(*args):
                 events.append('migration')
                 if fail=='migration':raise receiver.Refused('MIGRATION_FAILED')
@@ -313,7 +317,7 @@ class ActivationTests(unittest.TestCase):
                 if receiver.rolling_back and fail=='rollback-drain':raise receiver.Refused('ACTIVE_WORK_DRAIN_TIMEOUT')
             for name, replacement in dict(atomic=atomic,current=lambda:(copy.deepcopy(old),copy.deepcopy(before)),
                 registry_handler=lambda:(handler,None),version_policy=lambda *args:None,artifact_directory=lambda h:target,
-                candidate_preflight=candidate,migration=migration,drain=drain,
+                candidate_preflight=candidate,api_shutdown_acceptance=acceptance,migration=migration,drain=drain,
                 release_operation_create=lambda *args:{'operationId':'test'},
                 release_operation_phase=lambda operation,phase:operation,release_operation_clear=lambda operation:None,
                 up_four=start,postflight=postflight,finish_liveness=lambda:None,command=command).items():
@@ -328,8 +332,9 @@ class ActivationTests(unittest.TestCase):
             stack.enter_context(patch.object(receiver,'api_drain_module',return_value=types.SimpleNamespace(Fence=FakeFence,DrainError=ValueError)))
             stack.enter_context(patch.object(receiver.shutil,'disk_usage',return_value=types.SimpleNamespace(free=10**12)))
             stack.enter_context(patch.object(receiver.time,'monotonic',side_effect=[0,181]))
-            if fail=='candidate':
-                with self.assertRaisesRegex(receiver.Refused,'CANDIDATE_REFUSED'):receiver.deploy(header,io.BytesIO())
+            if fail in('candidate','shutdown-acceptance'):
+                with self.assertRaisesRegex(receiver.Refused,'CANDIDATE_REFUSED'if fail=='candidate'else'API_SHUTDOWN_ACCEPTANCE_FAILED'):
+                    receiver.deploy(header,io.BytesIO())
                 self.assertNotIn('maintenance',events);self.assertNotIn('migration',events)
                 self.assertFalse(any(isinstance(e,tuple)and e[0]=='command' for e in events))
                 self.assertEqual(override.read_bytes(),previous)
@@ -383,6 +388,7 @@ class ActivationTests(unittest.TestCase):
                 self.assertTrue((receiver.STATE/'last-success.json').exists())
 
     def test_rejected_candidate_never_enters_maintenance_or_stops_services(self): self.deployment('candidate')
+    def test_failed_final_image_acceptance_preserves_running_services_and_override(self): self.deployment('shutdown-acceptance')
     def test_success_activates_the_same_preflighted_candidate(self): self.deployment()
     def test_failed_migration_retains_manual_recovery_marker(self): self.deployment('migration')
     def test_unclean_api_exit_restores_original_services_before_queue_drain_or_migration(self): self.deployment('shutdown')
