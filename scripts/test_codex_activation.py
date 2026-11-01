@@ -184,7 +184,7 @@ class ActivationTests(unittest.TestCase):
         active['api']['Id']='f'*64;active['worker-general']['State']['Running']=False
         receiver.ops=types.SimpleNamespace(inspect=lambda:active)
         proofs={kind:dict(targetId='new-'+kind)for kind in ('api','worker')}
-        with patch.object(receiver,'stop_api_for_release')as stop,patch.object(receiver,'drain')as drain:
+        with patch.object(receiver,'stop_api_guarded')as stop,patch.object(receiver,'drain')as drain:
             with self.assertRaisesRegex(receiver.Refused,'DRAIN_WORKER_UNAVAILABLE'):receiver.quiesce_for_rollback(before,proofs)
             stop.assert_called_once_with(active['api']);drain.assert_not_called()
 
@@ -314,8 +314,16 @@ class ActivationTests(unittest.TestCase):
             for name, replacement in dict(atomic=atomic,current=lambda:(copy.deepcopy(old),copy.deepcopy(before)),
                 registry_handler=lambda:(handler,None),version_policy=lambda *args:None,artifact_directory=lambda h:target,
                 candidate_preflight=candidate,migration=migration,drain=drain,
+                release_operation_create=lambda *args:{'operationId':'test'},
+                release_operation_phase=lambda operation,phase:operation,release_operation_clear=lambda operation:None,
                 up_four=start,postflight=postflight,finish_liveness=lambda:None,command=command).items():
                 stack.enter_context(patch.object(receiver,name,replacement))
+            class FakeFence:
+                def __init__(self,api,*args,**kwargs):self.api=api
+                def __enter__(self):return self
+                def __exit__(self,*args):pass
+                def stop(self,on_stopped):on_stopped();receiver.stop_api_for_release(self.api)
+            stack.enter_context(patch.object(receiver,'api_drain_module',return_value=types.SimpleNamespace(Fence=FakeFence,DrainError=ValueError)))
             stack.enter_context(patch.object(receiver.shutil,'disk_usage',return_value=types.SimpleNamespace(free=10**12)))
             stack.enter_context(patch.object(receiver.time,'monotonic',side_effect=[0,181]))
             if fail=='candidate':
@@ -326,6 +334,14 @@ class ActivationTests(unittest.TestCase):
                 return
             result=receiver.deploy(header,io.BytesIO())
             if fail:
+                if fail in ('migration','worker-shutdown'):
+                    self.assertEqual(result['status'],'failed');self.assertFalse(result['configurationRollbackSucceeded'])
+                    self.assertEqual(result['code'],'DEPLOY_FAILED_ROLLBACK_INCOMPLETE')
+                    self.assertEqual(result['rollbackCauseCode'],'API_DRAIN_MANUAL_RECOVERY_REQUIRED')
+                    self.assertFalse(any(isinstance(e,tuple)and e[0]=='command'and 'start'in e[1]for e in events))
+                    self.assertFalse(any(isinstance(e,tuple)and e[0]=='override'for e in events))
+                    self.assertEqual(override.read_bytes(),previous)
+                    return
                 if fail.startswith('rollback-'):
                     self.assertEqual(json.loads(override.read_bytes()),expected)
                     self.assertFalse(result['configurationRollbackSucceeded'])
@@ -363,9 +379,9 @@ class ActivationTests(unittest.TestCase):
 
     def test_rejected_candidate_never_enters_maintenance_or_stops_services(self): self.deployment('candidate')
     def test_success_activates_the_same_preflighted_candidate(self): self.deployment()
-    def test_failed_migration_restarts_original_ids_and_verifies_health(self): self.deployment('migration')
+    def test_failed_migration_retains_manual_recovery_marker(self): self.deployment('migration')
     def test_unclean_api_exit_restores_original_services_before_queue_drain_or_migration(self): self.deployment('shutdown')
-    def test_unclean_worker_exit_restores_original_services_before_migration(self): self.deployment('worker-shutdown')
+    def test_unclean_worker_exit_retains_manual_recovery_marker(self): self.deployment('worker-shutdown')
     def test_failed_migration_does_not_claim_recovery_for_unhealthy_old_services(self): self.deployment('migration',rollback_healthy=False)
     def test_failed_activation_restores_exact_prior_override_and_health(self): self.deployment('postflight')
     def test_failed_activation_restores_a_prior_runtime_package(self): self.deployment('postflight',previous_runtime=True)

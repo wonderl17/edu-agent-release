@@ -305,16 +305,83 @@ def release_lock():
   except BlockingIOError:raise Refused('ANOTHER_RELEASE_ACTIVE')
   yield
  finally:os.close(fd)
-def initialize():
+def initialize(action=None):
  global ops
  require(os.geteuid()==0 and ROOT.resolve()==ROOT and OPS.resolve()==OPS and ROOT.stat().st_uid==0,'TARGET_SCOPE_REFUSED')
- require_host_ready()
+ require_host_ready(allow_diagnostics=action in('verify','diagnostics'))
  private(OPS/'receiver.py');private(ROOT/'operations/startup/production-ops.py')
  spec=importlib.util.spec_from_file_location('production_ops',ROOT/'operations/startup/production-ops.py');ops=importlib.util.module_from_spec(spec);spec.loader.exec_module(ops)
  ops.fixed_env()
-def require_host_ready():
+def require_host_ready(allow_diagnostics=False):
  marker=STATE/'codex-host-install.pending.json'
  require(not(marker.exists()or marker.is_symlink()),'CODEX_HOST_INSTALLATION_RECOVERY_REQUIRED')
+ marker=STATE/'api-drain-install.pending.json'
+ require(not(marker.exists()or marker.is_symlink()),'API_DRAIN_INSTALLATION_RECOVERY_REQUIRED')
+ if allow_diagnostics:return
+ marker=STATE/'api-drain.pending.json'
+ require(not(marker.exists()or marker.is_symlink()),'API_DRAIN_RECOVERY_REQUIRED')
+ marker=STATE/'release-operation.pending.json'
+ require(not(marker.exists()or marker.is_symlink()),'RELEASE_OPERATION_RECOVERY_REQUIRED')
+
+def process_identity():
+ boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+ require(re.fullmatch('[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',boot),'RELEASE_OPERATION_BOOT_REFUSED')
+ raw=Path('/proc',str(os.getpid()),'stat').read_text();start=int(raw[raw.rfind(')')+2:].split()[19])
+ return{'bootId':boot,'ownerPid':os.getpid(),'ownerStart':start}
+
+def sync_directory(path):
+ fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC)
+ try:os.fsync(fd)
+ finally:os.close(fd)
+
+def release_operation_create(h,value,before):
+ path=STATE/'release-operation.pending.json'
+ require(not(path.exists()or path.is_symlink()),'RELEASE_OPERATION_RECOVERY_REQUIRED')
+ identities={}
+ for name in ('api','worker-general','worker-ppt'):
+  item=before[name]
+  require(re.fullmatch('[0-9a-f]{64}',item['Id'])and re.fullmatch('sha256:[0-9a-f]{64}',item['Image'])and
+          isinstance(item['State']['StartedAt'],str),'RELEASE_OPERATION_IDENTITY_REFUSED')
+  identities[name]={'id':item['Id'],'image':item['Image'],'startedAt':item['State']['StartedAt']}
+ data={'schemaVersion':1,'operationId':uuid.uuid4().hex,'sourceSha':h['sourceSha'],'version':h['version'],
+       'previousSourceSha':value['buildSha'],'containers':identities,'phase':'prepared',**process_identity()}
+ path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+ require(path.parent.resolve()==path.parent and path.parent.stat().st_uid==0,'RELEASE_OPERATION_DIRECTORY_UNSAFE')
+ fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+ with os.fdopen(fd,'w')as stream:json.dump(data,stream,sort_keys=True,separators=(',',':'));stream.write('\n');stream.flush();os.fsync(stream.fileno())
+ sync_directory(path.parent);return data
+
+def release_operation_phase(data,phase):
+ allowed=('api_stop_requested','api_stopped','worker_stop_requested','workers_stopped','migration_started',
+          'activation_started','verification_started','rollback_started','manual_recovery')
+ require(phase in allowed,'RELEASE_OPERATION_PHASE_REFUSED')
+ path=STATE/'release-operation.pending.json';private(path);current=decode(path.read_bytes())
+ require(isinstance(current,dict)and current.get('operationId')==data['operationId']and
+         all(current.get(k)==v for k,v in process_identity().items()),'RELEASE_OPERATION_OWNER_CHANGED')
+ current['phase']=phase;atomic(path,current);sync_directory(path.parent);return current
+
+def release_operation_clear(data):
+ path=STATE/'release-operation.pending.json';private(path);current=decode(path.read_bytes())
+ require(isinstance(current,dict)and current.get('operationId')==data['operationId']and
+         all(current.get(k)==v for k,v in process_identity().items()),'RELEASE_OPERATION_OWNER_CHANGED')
+ path.unlink();sync_directory(path.parent)
+
+def api_drain_module():
+ filename=OPS/'api_drain.py';private(filename)
+ spec=importlib.util.spec_from_file_location('production_api_drain',filename)
+ module=importlib.util.module_from_spec(spec)
+ exec(compile(filename.read_bytes(),str(filename),'exec'),module.__dict__)
+ require(callable(getattr(module,'Fence',None)),'API_DRAIN_HELPER_REQUIRED')
+ return module
+
+def stop_api_guarded(api,on_stop=lambda:None):
+ helper=api_drain_module()
+ def check_cancel():
+  if client_cancelled.is_set()and not rolling_back:raise Refused(client_reason or'CLIENT_DISCONNECTED')
+ try:
+  with helper.Fence(api,check_cancel=check_cancel)as fence:
+   fence.stop(on_stop)
+ except helper.DrainError as error:raise Refused(str(error))from None
 def current():
  ops.preflight();containers=ops.inspect();web=containers['web'];mounts=[x for x in web['Mounts']if x['Destination']=='/usr/share/nginx/html']
  require(len(mounts)==1 and mounts[0]['Type']=='bind'and mounts[0]['RW']is False,'CURRENT_WEB_MOUNT_REFUSED')
@@ -479,7 +546,7 @@ def quiesce_for_rollback(before,image_proofs):
  if all(active[name]['Id']==before[name]['Id']and active[name]['State'].get('Running')is False and
         active[name]['State'].get('ExitCode')==0 and not active[name]['State'].get('OOMKilled')and
         not active[name]['State'].get('Restarting')for name in roles):return
- stop_api_for_release(active['api'])
+ stop_api_guarded(active['api'])
  require(active['worker-general']['State'].get('Running')is True,'ROLLBACK_DRAIN_WORKER_UNAVAILABLE')
  drain(active['worker-general'])
  stop_workers_for_release(active['worker-general'],active['worker-ppt'])
@@ -596,19 +663,33 @@ def deploy(h,stream):
  if previous is not None:atomic(run_dir/'previous-compose.release.yaml',previous)
  stopped=False;switched=False;migration_started=False;migration_ok=False
  with ops.maintenance('ci-release-'+h['sourceSha'][:12],minutes=45):
+  operation=release_operation_create(h,value,before)
   try:
-   phase='drain';stopped=True;stop_api_for_release(before['api']);drain(before['worker-general'])
+   phase='drain'
+   operation=release_operation_phase(operation,'api_stop_requested')
+   def mark_stopped():
+    nonlocal stopped
+    stopped=True
+   stop_api_guarded(before['api'],mark_stopped)
+   operation=release_operation_phase(operation,'api_stopped')
+   drain(before['worker-general'])
+   phase='worker-stop'
+   operation=release_operation_phase(operation,'worker_stop_requested')
    stop_workers_for_release(before['worker-general'],before['worker-ppt'])
-   phase='migration';migration_started=True;migration(h,m);migration_ok=True
-   phase='activate';switched=True;atomic(OVERRIDE,candidate);ops.preflight();up_four()
-   phase='verify';verification=postflight(h,m,before,image_proofs)
+   operation=release_operation_phase(operation,'workers_stopped')
+   phase='migration';operation=release_operation_phase(operation,'migration_started');migration_started=True;migration(h,m);migration_ok=True
+   phase='activate';operation=release_operation_phase(operation,'activation_started');switched=True;atomic(OVERRIDE,candidate);ops.preflight();up_four()
+   phase='verify';operation=release_operation_phase(operation,'verification_started');verification=postflight(h,m,before,image_proofs)
    finish_liveness()
    result={'status':'deployed','version':h['version'],'sourceSha':h['sourceSha'],'snapshotId':snapshot_id,'backupPolicy':'mac-direct-daily-no-pre-release-backup','verification':verification,'deployedAt':utc(),'sourceRepository':SOURCE}
-   atomic(STATE/'last-success.json',result);atomic(target/'deployment-receipt.json',result)
+   atomic(STATE/'last-success.json',result);atomic(target/'deployment-receipt.json',result);release_operation_clear(operation)
   except Exception as error:
    rolling_back=True
    phase_before_rollback=phase;rollback_ok=True;rollback_cause=None
    try:
+    if phase_before_rollback in('worker-stop','migration','activate')or isinstance(error,Refused)and str(error)in('API_DRAIN_STOP_UNCERTAIN','API_DRAIN_CLEANUP_FAILED','API_DRAIN_RECOVERY_REQUIRED'):
+     raise Refused('API_DRAIN_MANUAL_RECOVERY_REQUIRED')
+    operation=release_operation_phase(operation,'rollback_started')
     if switched:
      quiesce_for_rollback(before,image_proofs)
      if previous is None:OVERRIDE.unlink(missing_ok=True)
@@ -616,6 +697,8 @@ def deploy(h,stream):
      up_four()
     elif stopped:command(DOCKER+['start',before['api']['Id'],before['worker-general']['Id'],before['worker-ppt']['Id']],timeout=60)
     if stopped:verify_restored(value,before,recreated=switched)
+    else:require(ops.snapshot().get('healthy')is True,'ROLLBACK_HEALTH_NOT_RESTORED')
+    release_operation_clear(operation)
    except Exception as rollback_error:rollback_ok=False;rollback_cause=str(rollback_error)if isinstance(rollback_error,Refused)else type(rollback_error).__name__
    result={'status':'failed','code':'DEPLOY_FAILED_ROLLBACK_RESTORED'if rollback_ok else'DEPLOY_FAILED_ROLLBACK_INCOMPLETE','causeCode':str(error)if isinstance(error,Refused)else type(error).__name__,'rollbackCauseCode':rollback_cause,'phase':phase_before_rollback,'version':h['version'],'sourceSha':h['sourceSha'],'snapshotId':snapshot_id,'configurationRollbackSucceeded':rollback_ok,'databaseAutomaticallyRestored':False,'migrationStarted':migration_started,'migrationSucceeded':migration_ok,'manualDatabaseReviewRequired':migration_started,'failedAt':utc()}
    atomic(STATE/'last-failure.json',result);atomic(run_dir/'failure-receipt.json',result);return result
@@ -665,7 +748,7 @@ def main():
  global phase
  require(len(sys.argv)==1,'ARGUMENTS_REFUSED');stream=os.fdopen(os.dup(sys.stdin.fileno()),'rb',buffering=0)
  try:
-  signal.alarm(45);h=header(stream);initialize();signal.alarm(10800 if h['action']in('deploy','stage')else 1830 if h['action']=='resume-transfer'else 180 if h['action']=='prepare-transfer'else 120 if h['action']=='diagnostics'else 45)
+  signal.alarm(45);h=header(stream);initialize(h['action']);signal.alarm(10800 if h['action']in('deploy','stage')else 1830 if h['action']=='resume-transfer'else 180 if h['action']=='prepare-transfer'else 120 if h['action']=='diagnostics'else 45)
   if h['action']=='diagnostics':return diagnostics(h,stream)
   if h['action']=='verify':require(stream.read(1)==b'','PAYLOAD_UNEXPECTED');return verify(h)
   if h['action']=='prepare-registry':

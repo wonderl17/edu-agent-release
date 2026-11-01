@@ -255,8 +255,9 @@ def main():
             raise ValueError('CODEX_CONFIGURATION_OPERATOR_SCOPE')
     if Path(__file__).resolve()!=root/'codex_configure.py':raise ValueError('CODEX_CONFIGURATION_OPERATOR_SCOPE')
     spec=importlib.util.spec_from_file_location('configuration_receiver',root/'receiver.py')
-    c=importlib.util.module_from_spec(spec);spec.loader.exec_module(c);c.initialize()
+    c=importlib.util.module_from_spec(spec);spec.loader.exec_module(c)
     c.require(len(sys.argv)==2 and sys.argv[1]in('status','apply','recover'),'CODEX_CONFIGURATION_ACTION')
+    c.initialize('verify' if sys.argv[1]=='status' else None)
     signal.alarm(1200)
     if sys.argv[1]=='apply':
         data=sys.stdin.buffer.read(20001);c.require(0<len(data)<=20000,'CODEX_CONFIGURATION_REQUEST_SIZE')

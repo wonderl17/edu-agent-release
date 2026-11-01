@@ -92,6 +92,12 @@ class InstallationTests(unittest.TestCase):
     def assert_before(self,f):
         self.assertEqual(f.actual(),f.before());self.assertFalse((f.root/install.PENDING).exists())
 
+    def test_other_release_recovery_markers_block_install(self):
+        for name in ('api-drain.pending.json','release-operation.pending.json','api-drain-install.pending.json'):
+            with self.subTest(name=name):
+                f=self.fixture();save(f.root/'operations/release/state'/name,b'{}')
+                with self.assertRaisesRegex(ValueError,'RECOVERY_REQUIRED'):f.installer().check()
+
     def test_check_is_read_only_including_no_bytecode_tokens_or_locks(self):
         f=self.fixture();before={str(p):p.read_bytes()for p in f.root.rglob('*')if p.is_file()}
         self.assertEqual(f.installer().check()['status'],'verified')

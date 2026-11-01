@@ -88,7 +88,9 @@ class Installer:
         return path.read_bytes()
 
     def read(self,name,missing=False,limit=524288):
-        require(name in set(FILES)|DEPENDENCIES|{SETTINGS,PENDING,RECEIPT,'operations/release/state/codex-configuration.pending.json'},'HOST_INSTALL_PATH_SCOPE')
+        require(name in set(FILES)|DEPENDENCIES|{SETTINGS,PENDING,RECEIPT,'operations/release/state/codex-configuration.pending.json',
+                'operations/release/state/api-drain.pending.json','operations/release/state/release-operation.pending.json',
+                'operations/release/state/api-drain-install.pending.json'},'HOST_INSTALL_PATH_SCOPE')
         return self.private(self.root/name,limit,missing)
 
     def write(self,name,raw):
@@ -134,6 +136,9 @@ class Installer:
     def expected(self,m):
         require(self.read(PENDING,True,2097152)is None,'HOST_INSTALL_RECOVERY_REQUIRED')
         require(self.read('operations/release/state/codex-configuration.pending.json',True)is None,'HOST_CONFIGURATION_RECOVERY_REQUIRED')
+        require(self.read('operations/release/state/api-drain.pending.json',True)is None,'API_DRAIN_RECOVERY_REQUIRED')
+        require(self.read('operations/release/state/release-operation.pending.json',True)is None,'RELEASE_OPERATION_RECOVERY_REQUIRED')
+        require(self.read('operations/release/state/api-drain-install.pending.json',True)is None,'API_DRAIN_INSTALLATION_RECOVERY_REQUIRED')
         for name,row in m['files'].items():
             data=self.read(name,True)
             require((digest(data)if data is not None else None)==row['beforeSha256'],'HOST_INSTALL_STALE_SOURCE')
