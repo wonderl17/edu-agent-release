@@ -239,7 +239,7 @@ class ActivationTests(unittest.TestCase):
     def deployment(self, fail=None, previous_runtime=False, rollback_healthy=True):
         """Run the real deploy control flow; replace only host/registry side effects."""
         receiver=self.receiver; events=[]; before=containers(previous_runtime)
-        old=dict(version='0.0.125',buildSha='c'*40); header=dict(version='0.0.126',sourceSha='a'*40,bundleBytes=1)
+        old=dict(version='0.0.125',buildSha='c'*40); header=dict(version='0.0.126',sourceSha='a'*40,bundleBytes=1,bundleSha256='b'*64)
         manifest=package(); expected=dict(services={'candidate':{}})
         candidate_containers=containers(True)
         for name in ('api','worker-general','worker-ppt'):
@@ -252,7 +252,7 @@ class ActivationTests(unittest.TestCase):
             root=Path(directory); target=root/'releases/current'; opsdir=root/'operations';opsdir.mkdir()
             target.parent.mkdir()
             override=opsdir/'compose.release.yaml';previous=b'{"previous":"exact bytes"}\n';override.write_bytes(previous)
-            receiver.OPS=opsdir;receiver.OVERRIDE=override;receiver.STATE=opsdir/'state'
+            receiver.OPS=opsdir;receiver.OVERRIDE=override;receiver.STATE=opsdir/'state';receiver.RELEASES=root/'releases'
             receiver.rolling_back=False
             def atomic(path,value):
                 path.parent.mkdir(parents=True,exist_ok=True)

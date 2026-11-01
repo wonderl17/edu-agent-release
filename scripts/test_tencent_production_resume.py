@@ -24,7 +24,8 @@ class OriginalPackageResumeTests(unittest.TestCase):
         self.assertNotIn("inputs.previous_transfer_ticket", workflow)
         self.assertIn("inputs.operation == 'resume' && secrets.TENCENT_PRODUCTION_PREVIOUS_TRANSFER_TICKET || ''", workflow)
 
-    def execute_fixture(self, *, healthy=True, resume_result=None, cancelled=False):
+    def execute_fixture(self, *, healthy=True, resume_result=None, cancelled=False,
+                        original_state="staged", recovery_required=False, lost_response=False, legacy_status=False):
         events, remote_calls, git_calls, source_paths = [], [], [], []
         stdout = io.StringIO()
         token = self.PRIVATE_SENTINEL + "_APP"
@@ -89,6 +90,18 @@ class OriginalPackageResumeTests(unittest.TestCase):
             remote_calls.append(dict(request))
             action = request["action"]
             events.append(action)
+            if action == "release-status":
+                if legacy_status:
+                    raise target.UnsupportedReleaseStatus(44)
+                if "previousTransferTicket" in request:
+                    self.assertEqual(request["previousTransferTicket"], self.OLD_TICKET)
+                else:
+                    self.assertEqual((request["bundleBytes"], request["bundleSha256"]), (7, self.BUNDLE_HASH))
+                observed_state = "deployed" if lost_response and any(c["action"] == "deploy" for c in remote_calls) else original_state
+                return {"status": "release_status", "state": observed_state,
+                        "sourceSha": self.SOURCE_SHA, "version": "0.0.125", "bundleBytes": 7,
+                        "bundleSha256": self.BUNDLE_HASH, "recoveryRequired": recovery_required,
+                        "verification": {"healthy": True}}
             if action == "verify":
                 return {"status": "verified", "configValid": True, "healthy": healthy,
                         "version": "0.0.125", "currentSourceSha": self.CURRENT_SHA,
@@ -113,6 +126,8 @@ class OriginalPackageResumeTests(unittest.TestCase):
                 self.assertEqual(request["bundleSha256"], self.BUNDLE_HASH)
                 self.assertIs(request["allowSameVersionSourceChange"], True)
                 self.assertEqual(request["expectedCurrentSourceSha"], self.CURRENT_SHA)
+                if lost_response:
+                    raise target.TransportFailure(44)
                 return {"status": "deployed", "sourceSha": self.SOURCE_SHA, "version": "0.0.125"}
             if action == "diagnostics":
                 self.assertIsNotNone(payload)
@@ -137,8 +152,6 @@ class OriginalPackageResumeTests(unittest.TestCase):
                     failure = error
                 build.assert_not_called()
                 upload.assert_not_called()
-                if not healthy:
-                    authentication.assert_not_called()
             self.assertEqual(list(Path(directory).iterdir()), [])
             self.assertTrue(all(not path.exists() for path in source_paths))
         self.assertNotIn(self.PRIVATE_SENTINEL, stdout.getvalue())
@@ -147,20 +160,21 @@ class OriginalPackageResumeTests(unittest.TestCase):
     def test_resume_validates_main_then_reuses_new_bound_ticket_without_build_or_upload(self):
         events, calls, git, failure = self.execute_fixture()
         self.assertIsNone(failure)
-        self.assertEqual(events, ["verify", "app-read-auth", "main-ancestor-checked", "source-checked-out",
+        self.assertEqual(events, ["app-read-auth", "main-ancestor-checked", "source-checked-out", "release-status", "verify",
                                   "record-attempt", "deployment-created", "resume-transfer", "deploy",
                                   "deployment-status-success", "app-token-revoked"])
-        self.assertEqual([call["action"] for call in calls], ["verify", "record-attempt", "resume-transfer", "deploy"])
+        self.assertEqual([call["action"] for call in calls], ["release-status", "verify", "record-attempt", "resume-transfer", "deploy"])
         self.assertLess(git.index(["git", "merge-base", "--is-ancestor", self.SOURCE_SHA, "refs/remotes/origin/main"]),
                         git.index(["git", "checkout", "--quiet", "--detach", self.SOURCE_SHA]))
         self.assertIn(["git", "fetch", "--quiet", "--no-tags", "--filter=blob:none", "origin", "main"], git)
 
-    def test_unhealthy_target_does_not_access_private_source_or_reuse_any_package(self):
+    def test_unhealthy_target_allows_readonly_reconciliation_but_no_mutation(self):
         events, calls, git, failure = self.execute_fixture(healthy=False)
         self.assertIsInstance(failure, target.Failure)
         self.assertEqual(failure.code, 44)
-        self.assertEqual(events, ["verify", "diagnostics"])
-        self.assertEqual(git, [])
+        self.assertEqual(events, ["app-read-auth", "main-ancestor-checked", "source-checked-out", "release-status",
+                                  "verify", "diagnostics", "app-token-revoked"])
+        self.assertTrue(git)
         self.assertFalse(any(call["action"] in ("resume-transfer", "deploy") for call in calls))
 
     def test_invalid_resume_receipt_never_deploys_and_cleans_private_files(self):
@@ -172,6 +186,34 @@ class OriginalPackageResumeTests(unittest.TestCase):
         self.assertNotIn("deploy", [call["action"] for call in calls])
         self.assertIn("deployment-status-error", events)
         self.assertEqual(events[-1], "app-token-revoked")
+
+    def test_already_verified_package_does_not_stop_migrate_build_or_create_another_deployment(self):
+        events, calls, _, failure = self.execute_fixture(original_state="deployed")
+        self.assertIsNone(failure)
+        self.assertEqual([call["action"] for call in calls], ["release-status"])
+        self.assertNotIn("deployment-created", events)
+
+    def test_pending_or_incomplete_migration_never_repeats_mutation(self):
+        for state, required in (("pending", False), ("failed", True)):
+            with self.subTest(state=state):
+                _, calls, _, failure = self.execute_fixture(original_state=state, recovery_required=required)
+                self.assertIsInstance(failure, target.Failure)
+                self.assertEqual(failure.code, 48)
+                self.assertFalse(any(call["action"] in ("verify", "resume-transfer", "record-attempt", "deploy") for call in calls))
+
+    def test_lost_deployment_response_reconnects_only_status_and_never_repeats_deploy(self):
+        events, calls, _, failure = self.execute_fixture(lost_response=True)
+        self.assertIsNone(failure)
+        actions = [call["action"] for call in calls]
+        self.assertEqual(actions.count("deploy"), 1)
+        self.assertEqual(actions[-2:], ["deploy", "release-status"])
+        self.assertIn("deployment-status-success", events)
+
+    def test_healthy_legacy_receiver_keeps_exact_original_ticket_resume_without_building(self):
+        events, calls, _, failure = self.execute_fixture(legacy_status=True)
+        self.assertIsNone(failure)
+        self.assertEqual([c["action"] for c in calls], ["release-status", "verify", "record-attempt", "resume-transfer", "deploy"])
+        self.assertIn("deployment-status-success", events)
 
     def test_cancelled_resume_never_deploys_or_starts_diagnostic_transfer(self):
         events, calls, _git, failure = self.execute_fixture(cancelled=True)

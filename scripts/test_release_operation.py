@@ -18,7 +18,7 @@ class ReleaseOperationTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.receiver=load();self.receiver.STATE=Path(self.temp.name).resolve()
-        self.header={'version':'0.0.133','sourceSha':'a'*40};self.previous={'buildSha':'b'*40}
+        self.header={'version':'0.0.133','sourceSha':'a'*40,'bundleBytes':123,'bundleSha256':'d'*64};self.previous={'buildSha':'b'*40}
         self.before={name:{'Id':str(index)*64,'Image':'sha256:'+str(index)*64,'State':{'StartedAt':'synthetic'}}
                      for index,name in enumerate(('api','worker-general','worker-ppt'),start=1)}
 

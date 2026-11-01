@@ -19,9 +19,9 @@ class ForceResumeTests(unittest.TestCase):
     def setUp(self):
         self.receiver=load();self.directory=tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup);self.receiver.STATE=Path(self.directory.name)
-        self.h={'sourceSha':self.receiver.FORCE_RESUME_SHA,'version':self.receiver.FORCE_RESUME_VERSION,
+        self.h={'sourceSha':'a'*40,'version':'7.4.2',
                 'bundleSha256':'f'*64,'bundleBytes':1234}
-        self.value={'buildSha':self.receiver.FORCE_PREVIOUS_SHA}
+        self.value={'buildSha':'b'*40}
         self.api={'Id':'a'*64,'Image':'sha256:'+'b'*64,'State':{'StartedAt':'original'}}
         self.registry={'transport':'registry','previousTransferTicket':'c'*32,'bundleSha256':'f'*64,'bundleBytes':1234}
         self.auth={'schemaVersion':1,'action':'one-shot-resume-force-stop','nonce':'d'*32,'bootId':'test-boot',
