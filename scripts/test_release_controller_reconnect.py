@@ -80,6 +80,37 @@ class ControllerReconnectTests(unittest.TestCase):
         self.assertIsNone(target.receiver_cause(json.dumps(dict(safe, causeCode="PRIVATE_SENTINEL"))))
         self.assertIsNone(target.receiver_failure(json.dumps(dict(safe, phase="PRIVATE_SENTINEL"))))
 
+    def test_only_explicit_legacy_action_refusal_allows_legacy_resume_preflight(self):
+        for allowed in (True, False):
+            with self.subTest(allowed=allowed), patch.object(target, "remote", side_effect=target.UnsupportedReleaseStatus(44)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                if allowed:
+                    self.assertIsNone(target.original_release_status([], {}, None, self.base,
+                        previous_ticket="d" * 32, allow_legacy=True))
+                else:
+                    with self.assertRaises(target.UnsupportedReleaseStatus):
+                        target.original_release_status([], {}, None, self.base, metadata=self.metadata)
+        with patch.object(target, "remote", side_effect=target.Failure(44)), self.assertRaises(target.Failure):
+            target.original_release_status([], {}, None, self.base, previous_ticket="d" * 32, allow_legacy=True)
+
+    def test_lost_write_on_legacy_receiver_is_unknown_and_never_replayed(self):
+        with patch.object(target, "remote", side_effect=[target.TransportFailure(44), target.UnsupportedReleaseStatus(44)]) as remote, \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(target.Failure) as failure:
+            target.apply_original_package([], {}, None, dict(self.base, action="deploy", bundleBytes=7, bundleSha256="b" * 64))
+        self.assertEqual(failure.exception.code, 48)
+        self.assertEqual([c.args[3]["action"] for c in remote.call_args_list], ["deploy", "release-status"])
+
+    def test_legacy_wire_refusal_is_distinct_from_authentication_and_other_refusals(self):
+        class Process:
+            def __init__(self):
+                self.stdin = io.BytesIO()
+                self.returncode = 1
+            def communicate(self, **kwargs):
+                return json.dumps({"status": "failed", "code": "ACTION_REFUSED", "phase": "protocol"}).encode(), None
+        with patch.object(target.subprocess, "Popen", return_value=Process()), \
+                patch.object(target, "stop_process"), self.assertRaises(target.UnsupportedReleaseStatus):
+            target.remote([], {}, io.BytesIO(), dict(self.base, action="release-status"))
+
 
 if __name__ == "__main__":
     unittest.main()

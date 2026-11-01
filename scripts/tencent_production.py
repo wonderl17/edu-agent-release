@@ -46,6 +46,10 @@ class TransportFailure(Failure):
     """The observation channel failed; a mutating operation may have completed."""
 
 
+class UnsupportedReleaseStatus(Failure):
+    """An older receiver explicitly refused the new read-only action."""
+
+
 class UnsupportedBuildBackend(Failure):
     """A source/backend combination refused before recording a release attempt."""
 
@@ -216,6 +220,7 @@ def ssh_configuration(env, private):
 # Only fixed receiver failure categories are allowed into public Actions output
 # or uploaded diagnostics. Never forward arbitrary receiver JSON or stdout.
 RECEIVER_FAILURE_CODES = frozenset({
+    "ACTION_REFUSED",
     "RECEIVER_FAILED", "PRIVATE_COMMAND_FAILED", "CLIENT_DISCONNECTED", "CLIENT_CANCELLED",
     "REGISTRY_MANIFEST_REFUSED", "REGISTRY_MANIFEST_HASH_MISMATCH", "REGISTRY_AUTH_DIRECTORY_UNSAFE",
     "REGISTRY_IMAGE_IDENTITY_MISMATCH", "REGISTRY_MANIFEST_CONTENT_MISMATCH",
@@ -324,6 +329,8 @@ def remote(ssh, child, log, request, payload=None):
             if process.returncode:
                 failure = receiver_failure(output) if len(output) <= 128 * 1024 else None
                 if failure:
+                    if request.get("action") == "release-status" and failure == ("ACTION_REFUSED", "protocol"):
+                        raise UnsupportedReleaseStatus(44)
                     cause = receiver_cause(output)
                     message = "Tencent Production: receiver refused (" + failure[0] + ", " + failure[1] + (", " + cause if cause else "") + ")."
                     status(message)
@@ -363,7 +370,7 @@ def remote(ssh, child, log, request, payload=None):
         raise
 
 
-def original_release_status(ssh, child, log, base, *, previous_ticket=None, metadata=None):
+def original_release_status(ssh, child, log, base, *, previous_ticket=None, metadata=None, allow_legacy=False):
     """Reconnect only a read. Never repeat stop, migration, or activation after EOF."""
     request = {key: base[key] for key in ("sourceSha", "version")}
     request["action"] = "release-status"
@@ -380,6 +387,11 @@ def original_release_status(ssh, child, log, base, *, previous_ticket=None, meta
                 time.sleep(1 << attempt)
                 continue
             break
+        except UnsupportedReleaseStatus:
+            if not allow_legacy:
+                raise
+            status("Tencent Production: legacy receiver; original-package identity and health checks remain required.")
+            return None
         except TransportFailure:
             if attempt == 2:
                 raise
@@ -410,8 +422,12 @@ def apply_original_package(ssh, child, log, request):
         return remote(ssh, child, log, request)
     except TransportFailure:
         status("Tencent Production: deployment response lost; checking the same immutable package.")
-        result = original_release_status(ssh, child, log, request,
-            metadata={"bytes": request["bundleBytes"], "sha256": request["bundleSha256"]})
+        try:
+            result = original_release_status(ssh, child, log, request,
+                metadata={"bytes": request["bundleBytes"], "sha256": request["bundleSha256"]})
+        except UnsupportedReleaseStatus:
+            status("Tencent Production: legacy receiver cannot confirm a lost response; no deployment repeated.")
+            raise Failure(48) from None
         if result["state"] != "deployed":
             status("Tencent Production: deployment not confirmed; resume the original package after recovery.")
             raise Failure(48)
@@ -620,8 +636,8 @@ def execute(env):
                         source_loaded = True
                         recovery = original_release_status(ssh, child, log,
                             {"sourceSha": requested, "version": version},
-                            previous_ticket=env["TENCENT_PREVIOUS_TRANSFER_TICKET"])
-                        if recovery["state"] == "deployed":
+                            previous_ticket=env["TENCENT_PREVIOUS_TRANSFER_TICKET"], allow_legacy=True)
+                        if recovery is not None and recovery["state"] == "deployed":
                             outcome = "success"
                             status("Tencent Production: original package already deployed and verified; no mutation repeated.")
                             return

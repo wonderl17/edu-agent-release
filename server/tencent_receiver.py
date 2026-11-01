@@ -370,6 +370,14 @@ def release_operation_clear(data):
          all(current.get(k)==v for k,v in process_identity().items()),'RELEASE_OPERATION_OWNER_CHANGED')
  path.unlink();sync_directory(path.parent)
 
+def record_failed_operation(operation,result,target,private_run):
+ # The marker is the only durable warning until the failure receipt commits.
+ # A crash/write failure at any earlier point must leave it in place. Persist
+ # the package-scoped record first so another package cannot hide this result.
+ for path in(target/'failure-receipt.json',STATE/'last-failure.json',private_run/'failure-receipt.json'):
+  atomic(path,result);sync_directory(path.parent)
+ if result.get('configurationRollbackSucceeded')is True:release_operation_clear(operation)
+
 def api_drain_module():
  filename=OPS/'api_drain.py';private(filename)
  spec=importlib.util.spec_from_file_location('production_api_drain',filename)
@@ -844,7 +852,6 @@ def deploy(h,stream):
     elif stopped:command(DOCKER+['start',before['api']['Id'],before['worker-general']['Id'],before['worker-ppt']['Id']],timeout=60)
     if stopped:verify_restored(value,before,recreated=switched)
     else:require(ops.snapshot().get('healthy')is True,'ROLLBACK_HEALTH_NOT_RESTORED')
-    release_operation_clear(operation)
    except Exception as rollback_error:rollback_ok=False;rollback_cause=str(rollback_error)if isinstance(rollback_error,Refused)else type(rollback_error).__name__
    result={'status':'failed','code':'DEPLOY_FAILED_ROLLBACK_RESTORED'if rollback_ok else'DEPLOY_FAILED_ROLLBACK_INCOMPLETE','causeCode':str(error)if isinstance(error,Refused)else type(error).__name__,'rollbackCauseCode':rollback_cause,'phase':phase_before_rollback,'version':h['version'],'sourceSha':h['sourceSha'],'bundleBytes':h['bundleBytes'],'bundleSha256':h['bundleSha256'],'snapshotId':snapshot_id,'configurationRollbackSucceeded':rollback_ok,'databaseAutomaticallyRestored':False,'migrationStarted':migration_started,'migrationSucceeded':migration_ok,'manualDatabaseReviewRequired':migration_started,'failedAt':utc()}
    if force_intent:
@@ -852,7 +859,7 @@ def deploy(h,stream):
      'requestAttempted':forced_requested,'stopConfirmed':stopped,
      'outcome':'confirmed' if stopped else 'unknown' if forced_requested else 'not_requested',
      **({'approvalId':forced['nonce']} if forced else {})}
-   atomic(STATE/'last-failure.json',result);atomic(run_dir/'failure-receipt.json',result);atomic(target/'failure-receipt.json',result);return result
+   record_failed_operation(operation,result,target,run_dir);return result
  return result
 def stage(h,stream):
  global run_dir,phase

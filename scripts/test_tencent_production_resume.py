@@ -25,7 +25,7 @@ class OriginalPackageResumeTests(unittest.TestCase):
         self.assertIn("inputs.operation == 'resume' && secrets.TENCENT_PRODUCTION_PREVIOUS_TRANSFER_TICKET || ''", workflow)
 
     def execute_fixture(self, *, healthy=True, resume_result=None, cancelled=False,
-                        original_state="staged", recovery_required=False, lost_response=False):
+                        original_state="staged", recovery_required=False, lost_response=False, legacy_status=False):
         events, remote_calls, git_calls, source_paths = [], [], [], []
         stdout = io.StringIO()
         token = self.PRIVATE_SENTINEL + "_APP"
@@ -91,6 +91,8 @@ class OriginalPackageResumeTests(unittest.TestCase):
             action = request["action"]
             events.append(action)
             if action == "release-status":
+                if legacy_status:
+                    raise target.UnsupportedReleaseStatus(44)
                 if "previousTransferTicket" in request:
                     self.assertEqual(request["previousTransferTicket"], self.OLD_TICKET)
                 else:
@@ -205,6 +207,12 @@ class OriginalPackageResumeTests(unittest.TestCase):
         actions = [call["action"] for call in calls]
         self.assertEqual(actions.count("deploy"), 1)
         self.assertEqual(actions[-2:], ["deploy", "release-status"])
+        self.assertIn("deployment-status-success", events)
+
+    def test_healthy_legacy_receiver_keeps_exact_original_ticket_resume_without_building(self):
+        events, calls, _, failure = self.execute_fixture(legacy_status=True)
+        self.assertIsNone(failure)
+        self.assertEqual([c["action"] for c in calls], ["release-status", "verify", "record-attempt", "resume-transfer", "deploy"])
         self.assertIn("deployment-status-success", events)
 
     def test_cancelled_resume_never_deploys_or_starts_diagnostic_transfer(self):
