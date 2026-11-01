@@ -730,6 +730,115 @@ def candidate_preflight(h,m,web):
  candidate=decode(command(ops.compose_argv(include_release=False)+['-f',str(path),'config','--format','json']))
  ops.validate_release(ops.config(include_release=False),candidate)
  return value
+SHUTDOWN_ACCEPTANCE_SCOPE='teaching-production-api-shutdown-v1'
+SHUTDOWN_ACCEPTANCE_CHECKS=frozenset(('original_entrypoint','transport_coexistence','graceful_exit',
+ 'business_failure_nonzero','restart_recovery','resources_removed'))
+def shutdown_acceptance_command(args):
+ # Unlike a build, this process owns disposable containers and firewall rules.
+ # Cancel promptly, then let its bounded finally cleanup finish before exiting.
+ if client_cancelled.is_set():raise Refused(client_reason or'CLIENT_DISCONNECTED')
+ process=subprocess.Popen(args,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+  start_new_session=True,env={'PATH':'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+                            'HOME':'/root','LANG':'C.UTF-8'})
+ try:
+  deadline=time.monotonic()+900
+  while True:
+   if client_cancelled.is_set():raise Refused(client_reason or'CLIENT_DISCONNECTED')
+   remaining=deadline-time.monotonic()
+   require(remaining>0,'API_SHUTDOWN_ACCEPTANCE_FAILED')
+   try:stdout,stderr=process.communicate(timeout=min(1,remaining));break
+   except subprocess.TimeoutExpired:continue
+ except BaseException:
+  try:os.killpg(process.pid,signal.SIGTERM)
+  except ProcessLookupError:pass
+  try:stdout,stderr=process.communicate(timeout=90)
+  except subprocess.TimeoutExpired:
+   try:os.killpg(process.pid,signal.SIGKILL)
+   except ProcessLookupError:pass
+   stdout,stderr=process.communicate(timeout=5)
+  if stderr:log(stderr)
+  raise
+ if stderr:log(stderr)
+ require(process.returncode==0,'API_SHUTDOWN_ACCEPTANCE_FAILED')
+def validate_shutdown_acceptance(value,identity):
+ require(isinstance(value,dict)and all(value.get(key)==expected for key,expected in identity.items())and
+         type(value.get('schemaVersion'))is int and value['schemaVersion']==1 and
+         value.get('status')=='passed'and value.get('executionMode')=='helper'and
+         type(value.get('realModelCalls'))is int and value['realModelCalls']==0,
+         'API_SHUTDOWN_ACCEPTANCE_MISMATCH')
+ checks=value.get('checks')
+ require(isinstance(checks,dict)and set(checks)==SHUTDOWN_ACCEPTANCE_CHECKS and
+         all(checked is True for checked in checks.values()),'API_SHUTDOWN_ACCEPTANCE_INCOMPLETE')
+ timings=value.get('timings')
+ require(isinstance(timings,list)and len(timings)==2,'API_SHUTDOWN_ACCEPTANCE_INCOMPLETE')
+ for outage,expected in ((False,0),(True,1)):
+  rows=[row for row in timings if isinstance(row,dict)and row.get('databaseOutage')is outage]
+  require(len(rows)==1 and type(rows[0].get('exitCode'))is int and rows[0]['exitCode']==expected and
+          type(rows[0].get('seconds'))in(int,float)and 0<rows[0]['seconds']<30,
+          'API_SHUTDOWN_ACCEPTANCE_INCOMPLETE')
+ try:
+  verified=dt.datetime.fromisoformat(value['verifiedAt'].replace('Z','+00:00'))
+  require(verified.tzinfo is not None and verified<=dt.datetime.now(dt.timezone.utc)+dt.timedelta(minutes=1),
+          'API_SHUTDOWN_ACCEPTANCE_MISMATCH')
+ except (KeyError,TypeError,ValueError):raise Refused('API_SHUTDOWN_ACCEPTANCE_MISMATCH')
+ return value
+def api_shutdown_acceptance(h,m,image_proofs,before):
+ """Prove this final image can stop before changing any Production service.
+
+ The root-installed verifier creates its own labelled stack, empty stores and
+ scoped copy of the actual drain helper. A helper/verifier/kernel/image change
+ invalidates the cached proof; no mutable reference or signal-only proof counts.
+ """
+ verifier=OPS/'api_image_shutdown.py';helper=OPS/'api_drain.py'
+ for path in(verifier,helper):private(path)
+ reference=m['images']['api']['tag']
+ image_id=image_proofs['api']['targetId']
+ require(isinstance(image_id,str)and re.fullmatch('sha256:[0-9a-f]{64}',image_id),
+         'API_SHUTDOWN_IMAGE_REFERENCE_REQUIRED')
+ if isinstance(reference,str)and re.fullmatch(
+  r'docker\.cnb\.cool/shukezhinao/edu-agent-cloud-build/api@sha256:[0-9a-f]{64}',reference):
+  image_digest=reference.split('@')[1]
+ else:
+  # Explicit legacy original-package recovery retains its verified archive ID.
+  # Never execute the legacy mutable tag even after the archive proof passes.
+  require(reference=='teaching-ai-production/api:'+h['sourceSha'],'API_SHUTDOWN_IMAGE_REFERENCE_REQUIRED')
+  reference=image_digest=image_id
+ dependencies={name:before[name]['Image']for name in('postgres','redis')}
+ require(all(isinstance(value,str)and re.fullmatch('sha256:[0-9a-f]{64}',value)
+             for value in dependencies.values()),'API_SHUTDOWN_IMAGE_REFERENCE_REQUIRED')
+ identity={'scope':SHUTDOWN_ACCEPTANCE_SCOPE,'sourceSha':h['sourceSha'],'version':h['version'],
+  'apiImageDigest':image_digest,'apiImageId':image_id,'helperSha256':hash_file(helper),
+  'scriptSha256':hash_file(verifier),'kernel':os.uname().release}
+ key=hashlib.sha256(json.dumps({'identity':identity,'dependencies':dependencies},sort_keys=True,
+                             separators=(',',':')).encode()).hexdigest()
+ cache=STATE/'api-shutdown-acceptance';cache.mkdir(mode=0o700,exist_ok=True)
+ info=cache.lstat()
+ require(cache.resolve()==cache and stat.S_ISDIR(info.st_mode)and info.st_uid==0 and info.st_gid==0 and
+         stat.S_IMODE(info.st_mode)==0o700,'API_SHUTDOWN_ACCEPTANCE_PATH_UNSAFE')
+ receipt=cache/(key+'.json');reused=receipt.exists()or receipt.is_symlink()
+ if reused:
+  private(receipt);require(receipt.stat().st_size<=65536,'API_SHUTDOWN_ACCEPTANCE_MISMATCH')
+  report=validate_shutdown_acceptance(decode(receipt.read_bytes()),identity)
+ else:
+  output=run_dir/'api-shutdown-acceptance.json'
+  require(not(output.exists()or output.is_symlink()),'API_SHUTDOWN_ACCEPTANCE_PATH_UNSAFE')
+  shutdown_acceptance_command(['/usr/bin/python3','-I',str(verifier),'--api-image',reference,'--source-sha',h['sourceSha'],
+    '--version',h['version'],'--helper-source',str(helper),'--mode','helper','--output',str(output),
+    '--postgres-image',dependencies['postgres'],'--redis-image',dependencies['redis']])
+  private(output);require(output.stat().st_size<=65536,'API_SHUTDOWN_ACCEPTANCE_MISMATCH')
+  report=validate_shutdown_acceptance(decode(output.read_bytes()),identity)
+  require(hash_file(helper)==identity['helperSha256']and hash_file(verifier)==identity['scriptSha256'],
+          'API_SHUTDOWN_ACCEPTANCE_MISMATCH')
+ # A synthetic acceptance must never replace, stop or reconfigure a live service.
+ after=ops.inspect()
+ require(set(after)==set(before)and all(after[name]['Id']==item['Id']and after[name]['Image']==item['Image']and
+         after[name]['State']['StartedAt']==item['State']['StartedAt']for name,item in before.items()),
+         'API_SHUTDOWN_ACCEPTANCE_PRODUCTION_CHANGED')
+ require(ops.snapshot().get('healthy')is True,'TARGET_UNHEALTHY')
+ if not reused:atomic(receipt,report)
+ return{'scope':SHUTDOWN_ACCEPTANCE_SCOPE,'apiImageDigest':identity['apiImageDigest'],
+  'helperSha256':identity['helperSha256'],'scriptSha256':identity['scriptSha256'],
+  'receiptSha256':hash_file(receipt),'verifiedAt':report['verifiedAt'],'cached':reused}
 def remove_obsolete_runtime():
  ids=command(DOCKER+['ps','-aq','--filter','label=com.docker.compose.project='+PROJECT,'--filter','label=com.docker.compose.service=codex-agent-runtime']).decode().split()
  require(len(ids)<=1 and all(re.fullmatch('[0-9a-f]{12,64}',x)for x in ids),'CODEX_ORPHAN_SCOPE_REFUSED')
@@ -826,6 +935,7 @@ def deploy(h,stream):
  else:
   target.mkdir(mode=0o700);shutil.move(str(web),target/'web-dist');atomic(target/'manifest.json',(run_dir/'manifest.json').read_bytes())
  phase='candidate-preflight';candidate=candidate_preflight(h,m,target/'web-dist')
+ phase='api-shutdown-acceptance';shutdown_proof=api_shutdown_acceptance(h,m,image_proofs,before)
  previous=OVERRIDE.read_bytes()if OVERRIDE.exists()else None
  atomic(run_dir/'rollback-metadata.json',{'previousOverridePresent':previous is not None,'previousSourceSha':value['buildSha'],'snapshotId':snapshot_id})
  if previous is not None:atomic(run_dir/'previous-compose.release.yaml',previous)
@@ -857,6 +967,7 @@ def deploy(h,stream):
    phase='migration';operation=release_operation_phase(operation,'migration_started');migration_started=True;migration(h,m);migration_ok=True
    phase='activate';operation=release_operation_phase(operation,'activation_started');switched=True;atomic(OVERRIDE,candidate);ops.preflight();up_four()
    phase='verify';operation=release_operation_phase(operation,'verification_started');verification=postflight(h,m,before,image_proofs)
+   verification['apiShutdownAcceptance']=shutdown_proof
    finish_liveness()
    result={'status':'deployed','version':h['version'],'sourceSha':h['sourceSha'],'bundleBytes':h['bundleBytes'],'bundleSha256':h['bundleSha256'],'snapshotId':snapshot_id,'backupPolicy':'mac-direct-daily-no-pre-release-backup','verification':verification,'deployedAt':utc(),'sourceRepository':SOURCE,'apiShutdown':{'mode':'forced','approval':'claimed','requestAttempted':forced_requested,'stopConfirmed':stopped,'outcome':'confirmed','exitCode':137,'approvalId':forced['nonce']} if forced else {'mode':'graceful','exitCode':0}}
    atomic(STATE/'last-success.json',result);atomic(target/'deployment-receipt.json',result);release_operation_clear(operation)

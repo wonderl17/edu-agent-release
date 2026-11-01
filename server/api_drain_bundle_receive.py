@@ -22,7 +22,8 @@ ROOT = Path('/opt/teaching-ai-production')
 SCOPE = 'teaching-production-api-drain-update-v1'
 RECEIVER = 'operations/release/receiver.py'
 FILES = {RECEIVER: 'receiver.py', 'operations/release/api_drain.py': 'api_drain.py',
-         'operations/release/codex_configure.py': 'codex_configure.py'}
+         'operations/release/codex_configure.py': 'codex_configure.py',
+         'operations/release/api_image_shutdown.py': 'api_image_shutdown.py'}
 OPS = 'operations/startup/production-ops.py'
 BLOCKERS = ('operations/release/state/codex-host-install.pending.json',
             'operations/release/state/codex-configuration.pending.json',
@@ -119,7 +120,7 @@ class Receiver:
             row = manifest['files'][name]
             check(isinstance(row, dict) and set(row) == {'beforeSha256', 'afterSha256', 'payload'} and
                   row['payload'] == 'files/' + filename and
-                  ((row['beforeSha256'] is None and name.endswith('/api_drain.py')) or
+                  ((row['beforeSha256'] is None and name.endswith(('/api_drain.py', '/api_image_shutdown.py'))) or
                    isinstance(row['beforeSha256'], str) and re.fullmatch('[0-9a-f]{64}', row['beforeSha256'])) and
                   digest(files[row['payload']]) == row['afterSha256'], 'DRAIN_RECEIVE_MANIFEST_REFUSED')
             compile(files[row['payload']], filename, 'exec')

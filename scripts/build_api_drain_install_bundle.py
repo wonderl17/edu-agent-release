@@ -23,6 +23,7 @@ SOURCES = {
     'receiver.py': REPO / 'server/tencent_receiver.py',
     'api_drain.py': REPO / 'server/api_drain.py',
     'codex_configure.py': REPO / 'server/codex_configure.py',
+    'api_image_shutdown.py': REPO / 'server/api_image_shutdown.py',
 }
 
 
@@ -64,7 +65,7 @@ def build(audit, reviewed, output):
     rows = {}
     for target, filename in installer.FILES.items():
         before = audit['targets'][target]
-        check((before is None and target.endswith('/api_drain.py')) or
+        check((before is None and target.endswith(('/api_drain.py', '/api_image_shutdown.py'))) or
               isinstance(before, str) and re.fullmatch('[0-9a-f]{64}', before), 'DRAIN_BUNDLE_AUDIT_REFUSED')
         rows[target] = {'beforeSha256': before, 'afterSha256': reviewed[filename], 'payload': 'files/' + filename}
     check(all(isinstance(value, str) and re.fullmatch('[0-9a-f]{64}', value)
