@@ -174,6 +174,9 @@ class ProductionBoundaryTests(unittest.TestCase):
             marker.write_text('{}')
         def remote(_ssh, _child, _log, request, *args):
             action = request['action']
+            if action == 'release-status':
+                return dict(status='release_status', state='staged', sourceSha=sha, version='0.0.126',
+                            bundleBytes=7, bundleSha256='f'*64, recoveryRequired=False)
             if action == 'verify':
                 return dict(status='verified', configValid=True, healthy=True,
                             version='0.0.125', currentSourceSha='c'*40)

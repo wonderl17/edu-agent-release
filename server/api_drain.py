@@ -28,7 +28,6 @@ MOUNT='/usr/bin/mount'
 UMOUNT='/usr/bin/umount'
 PORT=4999
 VERIFIED_KERNEL='6.8.0-124-generic'
-COOKIE_GRACE_SECONDS=125
 JOURNAL=Path('/opt/teaching-ai-production/operations/release/state/api-drain.pending.json')
 RUN=Path('/run/teaching-production')
 
@@ -226,16 +225,15 @@ def advance_stop(tag):
     outcome='stop_uncertain'
     try:
         forced=data['forceExpiresAt'] is not None
-        if forced:
-            # A container ID can survive a restart. Reinspect the exact
-            # originally authorized process immediately before the signal.
-            observed=json.loads(run(DOCKER+['inspect',data['containerId']]))
-            require(len(observed)==1,'API_DRAIN_STOP_UNCERTAIN');before=observed[0];state=before['State']
-            require(before['Id']==data['containerId']and before['Image']==data['image']and
-                    state.get('Running')is True and not state.get('Restarting')and
-                    state.get('StartedAt')==data['startedAt']and state.get('Pid')==data['pid']and
-                    namespace_inode(data['pid'])==data['namespaceInode'],
-                    'API_DRAIN_STOP_UNCERTAIN')
+        # A container ID can survive a restart. Pin the same process for both
+        # ordinary TERM and explicitly authorized emergency KILL.
+        observed=json.loads(run(DOCKER+['inspect',data['containerId']]))
+        require(len(observed)==1,'API_DRAIN_STOP_UNCERTAIN');before=observed[0];state=before['State']
+        require(before['Id']==data['containerId']and before['Image']==data['image']and
+                state.get('Running')is True and not state.get('Restarting')and
+                state.get('StartedAt')==data['startedAt']and state.get('Pid')==data['pid']and
+                namespace_inode(data['pid'])==data['namespaceInode'],
+                'API_DRAIN_STOP_UNCERTAIN')
         if forced and time.time()>=data['forceExpiresAt']:
             outcome='stop_cancelled'
         else:
@@ -357,8 +355,8 @@ def unit_state(tag):
 
 class Fence:
     """One-use fence around stopping the exact preflight-verified API."""
-    def __init__(self,api,*,check_cancel=lambda:None,wait_seconds=900,fenced_wait_seconds=180,force_expires_at=None):
-        self.api=api;self.check_cancel=check_cancel;self.wait_seconds=wait_seconds;self.fenced_wait_seconds=fenced_wait_seconds
+    def __init__(self,api,*,check_cancel=lambda:None,force_expires_at=None):
+        self.api=api;self.check_cancel=check_cancel
         require(force_expires_at is None or type(force_expires_at) is int,'API_DRAIN_FORCE_AUTH_INVALID')
         self.force_expires_at=force_expires_at
         self.fd=None;self.watcher=False;self.listener=None;self.journal_created=False;self.uncertain=False
@@ -430,12 +428,12 @@ class Fence:
             self.identity()
             require(run(['/usr/bin/uname','-r']).decode().strip()==VERIFIED_KERNEL,'API_DRAIN_KERNEL_UNVERIFIED')
             require_no_server_fastopen(self.fd)
-            # Wait without denying anyone; an always-open observer will cause a
-            # safe timeout with no changes, never a forced disconnection.
-            if self.force_expires_at is None:self.idle(self.wait_seconds)
-            else:
+            # Live observers and reconnecting clients must not prevent TERM.
+            # Application shutdown owns admission closure and durable work
+            # draining; the fence only rejects additional external handshakes.
+            if self.force_expires_at is not None:
                 require(time.time()<self.force_expires_at,'API_DRAIN_FORCE_AUTH_EXPIRED')
-                self.sockets()
+            self.sockets()
             create_journal(self.tag,self.api,os.fstat(self.fd).st_ino,self.force_expires_at);self.journal_created=True
             require(RUN.resolve()==RUN and RUN.stat().st_uid==0 and RUN.stat().st_mode&0o777==0o700,'API_DRAIN_RUN_DIRECTORY')
             lock=marker(self.tag,'lock');lock_fd=os.open(lock,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600);os.close(lock_fd)
@@ -455,17 +453,12 @@ class Fence:
             with guard_lock(self.tag):
                 self.verify_watcher()
                 for binary in IPTABLES:rule(binary,self.fd,'-I',self.tag)
-            # Linux 6.8.0-124's checked headers bound cookie validity to 120s.
-            # A pre-fence SYN cookie may not appear in /proc/net/tcp; its ACK
-            # can become a connection later unless both gates age it out.
-            if self.force_expires_at is None:
-                self.idle(self.fenced_wait_seconds,require_rules=True,minimum_seconds=COOKIE_GRACE_SECONDS)
-            else:
-                # The operator explicitly accepted interruption of current API
-                # requests. The exact listener and dual SYN fence still must
-                # match immediately before the one-shot SIGKILL.
+            # No zero-TCP or SYN-cookie aging prerequisite: TERM closes the
+            # listener and may interrupt transports. Only a confirmed exit 0
+            # completes ordinary shutdown; timeout KILL/exit 1 remain unknown.
+            if self.force_expires_at is not None:
                 require(time.time()<self.force_expires_at,'API_DRAIN_FORCE_AUTH_EXPIRED')
-                self.sockets()
+            self.sockets()
             self.verify()
             return self
         except BaseException:

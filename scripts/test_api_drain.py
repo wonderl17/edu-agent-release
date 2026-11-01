@@ -90,8 +90,8 @@ class DrainUnitTests(unittest.TestCase):
             with self.subTest(scenario=scenario):
                 state={'tag':tag,'phase':'stop_started'if scenario=='resumed-started'else'stop_requested',
                        'parentPid':10,'parentStart':11,'expiresAt':10000,'containerId':'a'*64,
-                       'image':'sha256:'+'b'*64,'startedAt':'original','forceExpiresAt':None}
-                requests=[]
+                       'image':'sha256:'+'b'*64,'startedAt':'original','pid':777,'namespaceInode':888,'forceExpiresAt':None}
+                requests=[];inspects=[]
                 def update(_,phase):state['phase']=phase
                 def command(args,**kwargs):
                     if 'stop'in args:
@@ -99,11 +99,16 @@ class DrainUnitTests(unittest.TestCase):
                         if scenario=='timeout':raise TimeoutError('unknown daemon outcome')
                         if scenario=='crash':raise KeyboardInterrupt()
                         return b''
+                    if not inspects:
+                        inspects.append(1)
+                        return json.dumps([{'Id':state['containerId'],'Image':state['image'],'State':{
+                            'StartedAt':'original','Running':True,'Pid':777,'Restarting':False}}]).encode()
                     return json.dumps([{'Id':state['containerId'],'Image':state['image'],'State':{
                         'StartedAt':'original','Running':False,'ExitCode':0,'OOMKilled':False,'Restarting':False}}]).encode()
                 with patch.object(d,'guard_lock',lock),patch.object(d,'read_journal',side_effect=lambda:dict(state)),\
                      patch.object(d,'update_journal',side_effect=update),patch.object(d,'run',side_effect=command),\
                      patch.object(d,'marker_exists',side_effect=lambda _,suffix:scenario=='cancel'and suffix=='cancel'),\
+                     patch.object(d,'namespace_inode',return_value=888),\
                      patch.object(d,'process_alive',return_value=scenario!='parent-dead'),patch.object(d.time,'monotonic',return_value=1):
                     if scenario=='crash':
                         with self.assertRaises(KeyboardInterrupt):d.advance_stop(tag)
@@ -129,7 +134,7 @@ class DrainUnitTests(unittest.TestCase):
             def command(args,**kwargs):
                 if 'kill' in args or 'stop' in args:
                     requests.append(args);return b''
-                if state['forceExpiresAt'] is not None and not inspects:
+                if not inspects:
                     inspects.append(1)
                     return json.dumps([{'Id':state['containerId'],'Image':'sha256:'+'e'*64 if scenario=='changed_image' else state['image'],
                         'State':{'StartedAt':'changed' if scenario=='changed_start' else 'original',
@@ -154,6 +159,61 @@ class DrainUnitTests(unittest.TestCase):
                 'changed_start','changed_image','changed_namespace') else 1)
             if scenario in ('forced','wrong_exit','oom','post_changed_start','post_changed_image'):self.assertIn('kill',requests[0])
             if scenario=='normal_nonzero':self.assertIn('stop',requests[0])
+
+    def test_ordinary_stop_never_hides_failed_business_drain_oom_or_timeout_kill(self):
+        d=self.drain;tag='teaching-api-drain-'+'a'*32
+        @contextlib.contextmanager
+        def lock(_):yield
+        for exit_code,oom,changed in((0,False,False),(1,False,False),(137,False,False),(0,True,False),(0,False,True)):
+            with self.subTest(exit_code=exit_code,oom=oom,changed=changed):
+                state={'tag':tag,'phase':'stop_requested','parentPid':10,'parentStart':11,'expiresAt':10000,
+                       'containerId':'a'*64,'image':'sha256:'+'b'*64,'startedAt':'original','pid':777,
+                       'namespaceInode':888,'forceExpiresAt':None}
+                commands=[];inspects=[]
+                def command(args,**kwargs):
+                    if'stop'in args:commands.append(args);return b''
+                    live=not inspects;inspects.append(True)
+                    return json.dumps([{'Id':state['containerId'],'Image':state['image'],'State':{
+                        'StartedAt':'changed'if changed else'original','Running':live,'Pid':777,
+                        'ExitCode':exit_code,'OOMKilled':oom,'Restarting':False}}]).encode()
+                with patch.object(d,'guard_lock',lock),patch.object(d,'read_journal',side_effect=lambda:dict(state)),\
+                     patch.object(d,'update_journal',side_effect=lambda _,phase:state.update(phase=phase)),\
+                     patch.object(d,'run',side_effect=command),patch.object(d,'namespace_inode',return_value=888),\
+                     patch.object(d,'marker_exists',return_value=False),patch.object(d,'process_alive',return_value=True),\
+                     patch.object(d.time,'monotonic',return_value=1):
+                    d.advance_stop(tag);d.advance_stop(tag)
+                self.assertEqual(state['phase'],'stop_complete'if(exit_code,oom,changed)==(0,False,False)else'stop_uncertain')
+                self.assertEqual(commands,[]if changed else[d.DOCKER+['stop','--time','30','a'*64]])
+
+    def test_default_fence_admits_term_with_persistent_connections_without_sleeping(self):
+        d=self.drain;events=[];fence=d.Fence({'State':{'Pid':123}})
+        class RootRun:
+            def resolve(self):return self
+            def stat(self):return types.SimpleNamespace(st_uid=0,st_mode=0o40700)
+        @contextlib.contextmanager
+        def lock(_):yield
+        original_open=os.open
+        def open_namespace(path,*args,**kwargs):
+            return original_open(os.devnull,os.O_RDONLY)if str(path).startswith('/proc/')else original_open(path,*args,**kwargs)
+        def command(args,**kwargs):
+            if args==['/usr/bin/uname','-r']:return(d.VERIFIED_KERNEL+'\n').encode()
+            if args[:2]==[d.SYSTEMCTL,'show']:return b'not-found'
+            if args[0]==d.SYSTEMD_RUN:return b''
+            raise AssertionError(args)
+        with tempfile.TemporaryDirectory()as directory:
+            with patch.object(d,'RUN',RootRun()),patch.object(d,'marker',side_effect=lambda tag,suffix:Path(directory)/(tag+'.'+suffix)),\
+                 patch.object(d.os,'open',side_effect=open_namespace),patch.object(fence,'identity'),\
+                 patch.object(fence,'sockets',side_effect=lambda:events.append('live-connections')or 50),\
+                 patch.object(fence,'idle',side_effect=AssertionError('TCP zero must not gate TERM')),\
+                 patch.object(d.time,'sleep',side_effect=AssertionError('no pre-TERM sleep')),\
+                 patch.object(fence,'verify_watcher'),patch.object(fence,'verify'),patch.object(fence,'close'),\
+                 patch.object(d,'run',side_effect=command),patch.object(d,'require_no_server_fastopen'),\
+                 patch.object(d,'create_journal'),patch.object(d,'read_journal',return_value={'expiresAt':time.monotonic()+300}),\
+                 patch.object(d,'guard_lock',lock),patch.object(d,'rule',side_effect=lambda binary,*_:events.append(binary)):
+                try:fence.__enter__()
+                finally:
+                    if fence.fd is not None:os.close(fence.fd)
+        self.assertEqual(events,['live-connections',d.IPTABLES[0],d.IPTABLES[1],'live-connections'])
 
     @unittest.skipUnless(os.geteuid()==0 and os.path.exists('/proc/self/ns/net'),'requires Linux root')
     def test_authorized_force_installs_dual_fence_without_waiting_for_connections(self):

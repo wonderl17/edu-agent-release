@@ -37,6 +37,9 @@ class ProductionStageTests(unittest.TestCase):
             self.assertNotIn("PUBLIC_GH_TOKEN", child)
             self.assertNotIn("TENCENT_PRODUCTION_DEPLOY_SSH_KEY", child)
             calls.append(dict(request)); events.append(request["action"])
+            if request["action"] == "release-status":
+                return {"status": "release_status", "state": "staged", "sourceSha": self.SOURCE,
+                        "version": "0.0.125", "bundleBytes": 7, "bundleSha256": "f" * 64, "recoveryRequired": False}
             if request["action"] == "verify":
                 return target_result if target_result is not None else bootstrap
             if request["action"] == "prepare-transfer":
@@ -117,7 +120,8 @@ class ProductionStageTests(unittest.TestCase):
                 events, calls, records, failure = self.execute_fixture(operation=operation)
                 self.assertIsInstance(failure, target.Failure)
                 self.assertEqual(failure.code, 44)
-                self.assertNotIn("ancestor", events)
+                if operation != "resume":
+                    self.assertNotIn("ancestor", events)
                 self.assertEqual(records, [])
                 self.assertFalse(any(c["action"] in ("stage", "record-attempt", "deploy", "resume-transfer") for c in calls))
 

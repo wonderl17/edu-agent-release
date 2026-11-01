@@ -44,6 +44,16 @@ Apply `server/production-ops-cnb.patch` to the existing root-owned `operations/s
 
 COS is retained only for explicit legacy package recovery/compatibility. Its upload endpoint remains ordinary Beijing, with `accelerated_upload=false`; CNB failure never falls back to COS, local building or GCP. Desktop retains its existing publishing destinations.
 
+## Bounded shutdown and original-package reconnection
+
+The matching API and host helpers implement bounded shutdown. The fence immediately rejects additional external TCP handshakes for the exact old API namespace, then the watchdog issues one `docker stop --time 30`. Neither a zero-TCP instant nor a SYN-cookie aging window is a prerequisite. The API closes business admission, ends SSE with `service_restarting`, closes WebSockets with 1012, gives ordinary HTTP 15 seconds and bounds total shutdown at 25 seconds. Transport interruption alone can finish cleanly; durable business cleanup failure cannot. Ordinary shutdown still requires exit 0 and the same container/process/image identity, with no OOM. Legacy one-shot force authorization remains root-only, package/container/ticket bound and time limited, without a product-version hardcode.
+
+Normal `resume` validates the exact trusted source and reads `release-status` before a mutation. The status accepts the original ticket through stdin or an exact package hash/size; it never consumes a ticket or clears a pending marker. A successful receipt is accepted only after checking current Web, immutable images and health. Failure receipts persist per package; the newest same-package failure takes priority over an older success or stage receipt, and uncertain ordering is refused. Migration review or incomplete rollback must be reconciled before resume.
+
+If the deployment response is lost, the controller reconnects only the status read and never repeats the deployment command. Reads have a finite retry budget, and a live owner's cleanup receives only a short observation window. A confirmed deployment completes without building or migrating again; unresolved state reports recovery required. Explicit cancellation and SSH EOF retain the existing remote-cancellation contract. This is bounded observation and original-package recovery, not a detached daemon that ignores cancellation.
+
+Install the receiver and API-drain helper together under the existing checksum/control-lock procedure, then release the matching API/client through the normal pipeline. Updating the public controller alone does not install host helpers. The old API can require the scoped legacy force authorization for that first transition; do not globally accept exit 137 or ignore business drain failures. These source changes and isolated tests are not evidence of Production installation.
+
 ## Retired Tencent validation
 
 The `teaching-validation` stack is stopped and retained. Its workflow has no schedule, a fixed false job guard, and is disabled in GitHub; both validation enable variables are false. Keep its historical implementation only for explicitly scoped recovery research. All normal Cloud releases and checks use **Tencent Production**. Never reactivate validation consumers alongside Production or run the old COS/backup deployment path as a fallback.

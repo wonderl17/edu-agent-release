@@ -133,7 +133,6 @@ def prepare(root):
       "deadline=time.monotonic()+90":"deadline=time.monotonic()+15",
       "teaching-api-drain-":TEST_PREFIX,
     }
-    substitutions["COOKIE_GRACE_SECONDS=125"]="COOKIE_GRACE_SECONDS=2"
     for old,new in substitutions.items():
         expected=5 if old=='teaching-api-drain-'else 2 if old=='deadline=time.monotonic()+90'else 1
         check(source.count(old)==expected,'FIXTURE_SUBSTITUTION_REFUSED')
@@ -173,7 +172,7 @@ stdout,stderr=process.communicate(timeout=40);sys.stdout.buffer.write(stdout);sy
 def caller(root,case):
     module=load_fixture(root);api=json.loads((root/'api.json').read_text())
     try:
-        with module.Fence(api,wait_seconds=8,fenced_wait_seconds=10)as fence:
+        with module.Fence(api)as fence:
             store(root/'checkpoint.json',{'tag':fence.tag,'case':case})
             fence.stop()
         store(root/'caller-result.json',{'case':case,'status':'complete'})
@@ -245,7 +244,7 @@ def run_test(root,identifier):
             remove_containers(identifier)
             results.append(case)
         print(json.dumps({'status':'passed','cases':results,'realDockerDaemon':True,'syntheticContainersOnly':True,
-                          'cookieGraceSecondsInFixture':2,'stopDispatchesPerContainer':1,
+                          'tcpIdleWaitSeconds':0,'stopDispatchesPerContainer':1,
                           'businessTasksRun':0,'modelCalls':0}),flush=True)
     finally:
         try:clean_case(root,identifier)

@@ -27,9 +27,6 @@ ROOT=Path('/opt/teaching-ai-production');OPS=ROOT/'operations/release'
 RELEASES=ROOT/'releases';OVERRIDE=OPS/'compose.release.yaml';STATE=OPS/'state'
 PROJECT='teaching-production'
 PROTOCOL='teaching-production-ci-v1';SOURCE='shukezhinao/edu-agent'
-FORCE_RESUME_SHA='4fbca8ac76563088319f03645150be6e96528d7c'
-FORCE_RESUME_VERSION='0.0.133'
-FORCE_PREVIOUS_SHA='c321ebfbaaa51afc062055d5875ee860487c6883'
 MAX_BUNDLE=8*1024**3;MAX_DIAGNOSTICS=5*1024**2;MAX_IMAGES=32*1024**3;MAX_WEB=512*1024**2
 MAX_RELAY=5*1024**3
 DOCKER=['/usr/bin/docker','--host','unix:///var/run/docker.sock']
@@ -61,12 +58,15 @@ def atomic(path,value):
 def header(stream):
  raw=stream.readline(16385);require(len(raw)<=16384 and raw.endswith(b'\n'),'HEADER_LIMIT_OR_TERMINATOR')
  h=decode(raw);require(isinstance(h,dict),'HEADER_OBJECT_REQUIRED')
- action=h.get('action');require(action in('verify','record-attempt','deploy','stage','diagnostics','prepare-transfer','prepare-registry','resume-transfer'),'ACTION_REFUSED')
+ action=h.get('action');require(action in('verify','release-status','record-attempt','deploy','stage','diagnostics','prepare-transfer','prepare-registry','resume-transfer'),'ACTION_REFUSED')
  expected={'protocol','action','sourceRepository','sourceSha','version'}
  if action in('deploy','stage','diagnostics','prepare-transfer','prepare-registry'):expected|={'bundleBytes','bundleSha256'}
  if action in('deploy','stage'):expected.add('clientKeepsInputOpen')
  if action in('deploy','stage')and'transferTicket'in h:expected.add('transferTicket')
  if action=='resume-transfer':expected.add('previousTransferTicket')
+ if action=='release-status':
+  if'previousTransferTicket'in h:expected.add('previousTransferTicket')
+  else:expected|={'bundleBytes','bundleSha256'}
  if action=='prepare-registry':expected.add('registryManifest')
  if action in('deploy','resume-transfer')and'initialGateId'in h:expected.add('initialGateId')
  if action in('deploy','stage','record-attempt','prepare-transfer','prepare-registry','resume-transfer')and('allowSameVersionSourceChange'in h or'expectedCurrentSourceSha'in h):expected|={'allowSameVersionSourceChange','expectedCurrentSourceSha'}
@@ -83,8 +83,8 @@ def header(stream):
  version_main,_,build=h['version'].partition('+');_,has_pre,pre=version_main.partition('-')
  if has_pre:require(all(x and(not x.isdigit()or x=='0'or not x.startswith('0'))for x in pre.split('.')),'SEMVER_PRERELEASE_REFUSED')
  if'+'in h['version']:require(all(build.split('.')),'SEMVER_BUILD_REFUSED')
- if action in('deploy','stage','diagnostics','prepare-transfer','prepare-registry'):
-  limit=MAX_BUNDLE if action in('deploy','stage')else MAX_RELAY if action in('prepare-transfer','prepare-registry')else MAX_DIAGNOSTICS
+ if action in('deploy','stage','diagnostics','prepare-transfer','prepare-registry')or action=='release-status'and'previousTransferTicket'not in h:
+  limit=MAX_BUNDLE if action in('deploy','stage','release-status')else MAX_RELAY if action in('prepare-transfer','prepare-registry')else MAX_DIAGNOSTICS
   require(type(h['bundleBytes'])is int and 0<h['bundleBytes']<=limit,'PAYLOAD_SIZE_REFUSED')
   require(isinstance(h['bundleSha256'],str)and re.fullmatch('[0-9a-f]{64}',h['bundleSha256']),'PAYLOAD_HASH_REFUSED')
  if'runId'in h:require(isinstance(h['runId'],str)and re.fullmatch('[0-9]{1,24}',h['runId']),'RUN_ID_REFUSED')
@@ -311,7 +311,7 @@ def release_lock():
 def initialize(action=None):
  global ops
  require(os.geteuid()==0 and ROOT.resolve()==ROOT and OPS.resolve()==OPS and ROOT.stat().st_uid==0,'TARGET_SCOPE_REFUSED')
- require_host_ready(allow_diagnostics=action in('verify','diagnostics'))
+ require_host_ready(allow_diagnostics=action in('verify','diagnostics','release-status'))
  private(OPS/'receiver.py');private(ROOT/'operations/startup/production-ops.py')
  spec=importlib.util.spec_from_file_location('production_ops',ROOT/'operations/startup/production-ops.py');ops=importlib.util.module_from_spec(spec);spec.loader.exec_module(ops)
  ops.fixed_env()
@@ -347,6 +347,7 @@ def release_operation_create(h,value,before):
           isinstance(item['State']['StartedAt'],str),'RELEASE_OPERATION_IDENTITY_REFUSED')
   identities[name]={'id':item['Id'],'image':item['Image'],'startedAt':item['State']['StartedAt']}
  data={'schemaVersion':1,'operationId':uuid.uuid4().hex,'sourceSha':h['sourceSha'],'version':h['version'],
+       'bundleBytes':h['bundleBytes'],'bundleSha256':h['bundleSha256'],
        'previousSourceSha':value['buildSha'],'containers':identities,'phase':'prepared',**process_identity()}
  path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
  require(path.parent.resolve()==path.parent and path.parent.stat().st_uid==0,'RELEASE_OPERATION_DIRECTORY_UNSAFE')
@@ -385,8 +386,7 @@ def claim_force_resume(h,value,api,registry):
  expected={'schemaVersion','action','nonce','bootId','sourceSha','version','bundleSha256','bundleBytes','previousTicketSha256','previousSourceSha','apiId','apiImage','apiStartedAt','expiresAt'}
  require(isinstance(auth,dict)and set(auth)==expected and type(auth['schemaVersion'])is int and auth['schemaVersion']==1 and
          auth['action']=='one-shot-resume-force-stop'and re.fullmatch('[0-9a-f]{32}',auth['nonce']) and
-         h['sourceSha']==FORCE_RESUME_SHA and h['version']==FORCE_RESUME_VERSION and
-         value['buildSha']==FORCE_PREVIOUS_SHA and auth['sourceSha']==h['sourceSha']and auth['version']==h['version']and
+         auth['sourceSha']==h['sourceSha']and auth['version']==h['version']and
          type(auth['bundleBytes'])is int and auth['bundleBytes']==h['bundleBytes'] and
          auth['bundleSha256']==h['bundleSha256'] and
          auth['previousSourceSha']==value['buildSha']and auth['bootId']==process_identity()['bootId']and
@@ -423,6 +423,106 @@ def read_state(name):
  path=STATE/name
  if not path.exists():return{}
  private(path);return decode(path.read_bytes())
+
+def optional_record(path):
+ # Unlike a best-effort log read, a missing symlink is an identity failure.
+ if not(path.exists()or path.is_symlink()):return None
+ private(path);value=decode(path.read_bytes());require(isinstance(value,dict),'RELEASE_STATUS_RECORD_INVALID');return value
+
+def package_identity(h):
+ if'previousTransferTicket'not in h:return{key:h[key]for key in('sourceSha','version','bundleBytes','bundleSha256')}
+ ticket=h['previousTransferTicket'];record=optional_record(OPS/'transfers'/(ticket+'.json'))
+ require(record is not None,'TRANSFER_TICKET_NOT_FOUND')
+ require(type(record.get('schemaVersion'))is int and record['schemaVersion']==1 and type(record.get('used'))is bool and
+         record.get('scope')=='teaching-production'and record.get('ticket')==ticket and
+         record.get('sourceRepository')==SOURCE and all(record.get(k)==h[k]for k in('sourceSha','version')),
+         'TRANSFER_TICKET_IDENTITY_MISMATCH')
+ require(type(record.get('bundleBytes'))is int and 0<record['bundleBytes']<=MAX_BUNDLE and
+         isinstance(record.get('bundleSha256'),str)and re.fullmatch('[0-9a-f]{64}',record['bundleSha256']),
+         'TRANSFER_TICKET_IDENTITY_MISMATCH')
+ return{key:record[key]for key in('sourceSha','version','bundleBytes','bundleSha256')}
+
+def verified_receipt(identity,receipt):
+ require(all(key in receipt for key in identity),'RELEASE_RECEIPT_IDENTITY_MISSING')
+ require(all(receipt[key]==value for key,value in identity.items())and receipt.get('status')=='deployed',
+         'RELEASE_RECEIPT_IDENTITY_MISMATCH')
+ value,containers=current()
+ require(value['version']==identity['version']and value['buildSha']==identity['sourceSha'],'RELEASE_NO_LONGER_CURRENT')
+ snapshot=ops.snapshot();require(snapshot.get('healthy')is True,'TARGET_UNHEALTHY')
+ verification=receipt.get('verification',{});proofs=verification.get('images',{})
+ require(verification.get('healthy')is True and isinstance(proofs,dict)and all(kind in proofs for kind in('api','worker')),
+         'RELEASE_RECEIPT_VERIFICATION_MISSING')
+ for service,kind in(('api','api'),('worker-general','worker'),('worker-ppt','worker')):
+  proof=proofs[kind];require(isinstance(proof,dict)and isinstance(proof.get('targetId'),str)and
+                           containers[service]['Image']==proof['targetId'],'RUNNING_IMAGE_ID_MISMATCH')
+ target=RELEASES/identity['sourceSha']/identity['bundleSha256']
+ mounts=[mount for mount in containers['web'].get('Mounts',[])if mount.get('Destination')=='/usr/share/nginx/html']
+ require(len(mounts)==1 and mounts[0].get('Source')==str(target/'web-dist')and mounts[0].get('RW')is False,
+         'CURRENT_WEB_MOUNT_REFUSED')
+ if'codex-runtime'in proofs:
+  require(containers.get('codex-agent-runtime',{}).get('Image')==proofs['codex-runtime'].get('targetId'),'RUNNING_CODEX_IMAGE_ID_MISMATCH')
+  metadata=optional_record(target/'manifest.json');require(metadata is not None and isinstance(metadata.get('runtime'),dict),'RELEASE_RECEIPT_VERIFICATION_MISSING')
+  ops.codex_module().probe(ops.codex_context(),containers['api']['Id'],metadata['runtime'])
+ response=decode(command(['/usr/bin/curl','--silent','--show-error','--fail','--max-time','10','http://127.0.0.1:28080/version.json'],timeout=15))
+ require(response.get('version')==identity['version']and response.get('buildSha')==identity['sourceSha'],'PUBLIC_WEB_VERSION_MISMATCH')
+ return{'healthy':True,'version':identity['version'],'sourceSha':identity['sourceSha'],
+        'imagesVerified':len(proofs),'webSourceVerified':True,'checkedAt':utc()}
+
+def receipt_time(receipt,key):
+ value=receipt.get(key);require(isinstance(value,str),'RELEASE_RECEIPT_ORDER_UNCERTAIN')
+ try:moment=dt.datetime.fromisoformat(value.replace('Z','+00:00'))
+ except Exception:raise Refused('RELEASE_RECEIPT_ORDER_UNCERTAIN')
+ require(moment.tzinfo is not None,'RELEASE_RECEIPT_ORDER_UNCERTAIN');return moment
+
+def newest_receipt(local,global_record,identity,time_key):
+ if global_record is not None and all(global_record.get(key)==identity[key]for key in('sourceSha','version')):
+  require(all(key in global_record for key in identity),'RELEASE_RECEIPT_IDENTITY_MISSING')
+  if all(global_record.get(key)==value for key,value in identity.items()):
+   if local is None or receipt_time(global_record,time_key)>receipt_time(local,time_key):return global_record
+ return local
+
+def pending_owner_active(record):
+ if not isinstance(record,dict)or type(record.get('ownerPid'))is not int or record['ownerPid']<=1 or type(record.get('ownerStart'))is not int:return False
+ try:
+  if record.get('bootId')!=process_identity()['bootId']:return False
+  raw=Path('/proc',str(record['ownerPid']),'stat').read_text()
+  return int(raw[raw.rfind(')')+2:].split()[19])==record['ownerStart']
+ except Exception:return False
+
+def release_status(h):
+ """Read only: never create artifact directories, consume tickets or clear guards."""
+ global phase
+ phase='release-status'
+ identity=package_identity(h);result={'status':'release_status',**identity,'state':'absent','recoveryRequired':False}
+ operation=optional_record(STATE/'release-operation.pending.json')
+ for name in('api-drain.pending.json','release-operation.pending.json','codex-configuration.pending.json'):
+  pending=operation if name=='release-operation.pending.json'else optional_record(STATE/name)
+  if pending is not None:
+   allowed=('prepared','api_stop_requested','api_stopped','worker_stop_requested','workers_stopped','migration_started',
+            'activation_started','verification_started','rollback_started','manual_recovery','active','stop_requested',
+            'stop_started','stop_complete','stop_uncertain','stop_cancelled','cleaning','rules_removed')
+   return{**result,'state':'pending','recoveryRequired':True,'ownerActive':pending_owner_active(operation),
+          'phase':pending.get('phase')if pending.get('phase')in allowed else'unknown'}
+ target=RELEASES/identity['sourceSha']/identity['bundleSha256']
+ receipt=optional_record(target/'deployment-receipt.json')
+ if receipt is not None:
+  require(all(key in receipt for key in identity),'RELEASE_RECEIPT_IDENTITY_MISSING')
+  require(all(receipt.get(key)==value for key,value in identity.items()),'RELEASE_RECEIPT_IDENTITY_MISMATCH')
+ receipt=newest_receipt(receipt,optional_record(STATE/'last-success.json'),identity,'deployedAt')
+ failure=optional_record(target/'failure-receipt.json')
+ if failure is not None:
+  require(all(failure.get(key)==value for key,value in identity.items()),'RELEASE_RECEIPT_IDENTITY_MISMATCH')
+ failure=newest_receipt(failure,optional_record(STATE/'last-failure.json'),identity,'failedAt')
+ if failure is not None and(receipt is None or receipt_time(failure,'failedAt')>=receipt_time(receipt,'deployedAt')):
+  return{**result,'state':'failed','recoveryRequired':failure.get('configurationRollbackSucceeded')is not True or
+          failure.get('manualDatabaseReviewRequired')is True}
+ if receipt is not None:
+  return{**result,'state':'deployed','verification':verified_receipt(identity,receipt)}
+ staged=optional_record(target/'stage-receipt.json')
+ if staged is not None:
+  require(all(staged.get(key)==value for key,value in identity.items()),'RELEASE_RECEIPT_IDENTITY_MISMATCH')
+  return{**result,'state':'staged'}
+ return result
 def version_compare(left,right):
  def parts(version):
   main,_,pre=version.split('+',1)[0].partition('-');return tuple(int(x)for x in main.split('.')),pre.split('.')if pre else[]
@@ -656,6 +756,10 @@ def deploy(h,stream):
  global run_dir,phase,rolling_back
  require_host_ready()
  require(not(STATE/'codex-configuration.pending.json').exists(),'CODEX_CONFIGURATION_RECOVERY_REQUIRED')
+ observed=release_status(h)
+ if observed['state']=='deployed':
+  return{key:value for key,value in dict(observed,status='deployed',alreadyDeployed=True).items()if key not in('state','recoveryRequired')}
+ require(observed['recoveryRequired']is False,'RELEASE_OPERATION_RECOVERY_REQUIRED')
  if ops.fixed_env()['PRODUCTION_ACTIVATED']=='false':
   handler,context=initial_handler();return handler.deploy(context,h,stream)
  require('initialGateId'not in h,'INITIAL_GATE_ON_ACTIVE_RUNTIME_REFUSED')
@@ -723,7 +827,7 @@ def deploy(h,stream):
    phase='activate';operation=release_operation_phase(operation,'activation_started');switched=True;atomic(OVERRIDE,candidate);ops.preflight();up_four()
    phase='verify';operation=release_operation_phase(operation,'verification_started');verification=postflight(h,m,before,image_proofs)
    finish_liveness()
-   result={'status':'deployed','version':h['version'],'sourceSha':h['sourceSha'],'snapshotId':snapshot_id,'backupPolicy':'mac-direct-daily-no-pre-release-backup','verification':verification,'deployedAt':utc(),'sourceRepository':SOURCE,'apiShutdown':{'mode':'forced','approval':'claimed','requestAttempted':forced_requested,'stopConfirmed':stopped,'outcome':'confirmed','exitCode':137,'approvalId':forced['nonce']} if forced else {'mode':'graceful','exitCode':0}}
+   result={'status':'deployed','version':h['version'],'sourceSha':h['sourceSha'],'bundleBytes':h['bundleBytes'],'bundleSha256':h['bundleSha256'],'snapshotId':snapshot_id,'backupPolicy':'mac-direct-daily-no-pre-release-backup','verification':verification,'deployedAt':utc(),'sourceRepository':SOURCE,'apiShutdown':{'mode':'forced','approval':'claimed','requestAttempted':forced_requested,'stopConfirmed':stopped,'outcome':'confirmed','exitCode':137,'approvalId':forced['nonce']} if forced else {'mode':'graceful','exitCode':0}}
    atomic(STATE/'last-success.json',result);atomic(target/'deployment-receipt.json',result);release_operation_clear(operation)
   except Exception as error:
    rolling_back=True
@@ -742,13 +846,13 @@ def deploy(h,stream):
     else:require(ops.snapshot().get('healthy')is True,'ROLLBACK_HEALTH_NOT_RESTORED')
     release_operation_clear(operation)
    except Exception as rollback_error:rollback_ok=False;rollback_cause=str(rollback_error)if isinstance(rollback_error,Refused)else type(rollback_error).__name__
-   result={'status':'failed','code':'DEPLOY_FAILED_ROLLBACK_RESTORED'if rollback_ok else'DEPLOY_FAILED_ROLLBACK_INCOMPLETE','causeCode':str(error)if isinstance(error,Refused)else type(error).__name__,'rollbackCauseCode':rollback_cause,'phase':phase_before_rollback,'version':h['version'],'sourceSha':h['sourceSha'],'snapshotId':snapshot_id,'configurationRollbackSucceeded':rollback_ok,'databaseAutomaticallyRestored':False,'migrationStarted':migration_started,'migrationSucceeded':migration_ok,'manualDatabaseReviewRequired':migration_started,'failedAt':utc()}
+   result={'status':'failed','code':'DEPLOY_FAILED_ROLLBACK_RESTORED'if rollback_ok else'DEPLOY_FAILED_ROLLBACK_INCOMPLETE','causeCode':str(error)if isinstance(error,Refused)else type(error).__name__,'rollbackCauseCode':rollback_cause,'phase':phase_before_rollback,'version':h['version'],'sourceSha':h['sourceSha'],'bundleBytes':h['bundleBytes'],'bundleSha256':h['bundleSha256'],'snapshotId':snapshot_id,'configurationRollbackSucceeded':rollback_ok,'databaseAutomaticallyRestored':False,'migrationStarted':migration_started,'migrationSucceeded':migration_ok,'manualDatabaseReviewRequired':migration_started,'failedAt':utc()}
    if force_intent:
     result['apiShutdown']={'mode':'forced','approval':'claimed' if forced else 'claim_not_confirmed',
      'requestAttempted':forced_requested,'stopConfirmed':stopped,
      'outcome':'confirmed' if stopped else 'unknown' if forced_requested else 'not_requested',
      **({'approvalId':forced['nonce']} if forced else {})}
-   atomic(STATE/'last-failure.json',result);atomic(run_dir/'failure-receipt.json',result);return result
+   atomic(STATE/'last-failure.json',result);atomic(run_dir/'failure-receipt.json',result);atomic(target/'failure-receipt.json',result);return result
  return result
 def stage(h,stream):
  global run_dir,phase
@@ -798,6 +902,7 @@ def main():
   signal.alarm(45);h=header(stream);initialize(h['action']);signal.alarm(10800 if h['action']in('deploy','stage')else 1830 if h['action']=='resume-transfer'else 180 if h['action']=='prepare-transfer'else 120 if h['action']=='diagnostics'else 45)
   if h['action']=='diagnostics':return diagnostics(h,stream)
   if h['action']=='verify':require(stream.read(1)==b'','PAYLOAD_UNEXPECTED');return verify(h)
+  if h['action']=='release-status':require(stream.read(1)==b'','PAYLOAD_UNEXPECTED');return release_status(h)
   if h['action']=='prepare-registry':
    require(stream.read(1)==b'','PAYLOAD_UNEXPECTED');handler,context=registry_handler();return handler.prepare(context,h)
   if h['action']=='prepare-transfer':require(stream.read(1)==b'','PAYLOAD_UNEXPECTED');return prepare_transfer(h)

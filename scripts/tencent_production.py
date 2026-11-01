@@ -42,6 +42,10 @@ class Failure(Exception):
         self.code = code
 
 
+class TransportFailure(Failure):
+    """The observation channel failed; a mutating operation may have completed."""
+
+
 class UnsupportedBuildBackend(Failure):
     """A source/backend combination refused before recording a release attempt."""
 
@@ -224,10 +228,26 @@ RECEIVER_FAILURE_CODES = frozenset({
     "WEB_HTTP_ASSET_MISSING", "WEB_TREE_UNSAFE", "WEB_EXPANSION_LIMIT", "WEB_CONTAINER_INVALID",
     "CODEX_HOST_INSTALLATION_RECOVERY_REQUIRED", "CODEX_CONFIGURATION_RECOVERY_REQUIRED",
     "DEPLOY_FAILED_ROLLBACK_RESTORED", "DEPLOY_FAILED_ROLLBACK_INCOMPLETE",
+    "RELEASE_OPERATION_RECOVERY_REQUIRED", "API_DRAIN_RECOVERY_REQUIRED",
+    "API_DRAIN_CONNECTION_TIMEOUT", "API_DRAIN_STOP_UNCERTAIN", "API_DRAIN_CLEANUP_FAILED",
+    "API_DRAIN_MANUAL_RECOVERY_REQUIRED", "ACTIVE_WORK_DRAIN_TIMEOUT", "WORKER_SHUTDOWN_INCOMPLETE",
+    "RELEASE_STATUS_IDENTITY_MISMATCH", "RELEASE_STATUS_RECEIPT_UNBOUND",
+    "RELEASE_RECEIPT_IDENTITY_MISSING", "RELEASE_OPERATION_IDENTITY_MISMATCH",
+    "RELEASE_RECEIPT_IDENTITY_MISMATCH", "RELEASE_NO_LONGER_CURRENT", "TARGET_UNHEALTHY",
+    "RELEASE_RECEIPT_VERIFICATION_MISSING", "RUNNING_IMAGE_ID_MISMATCH",
+    "CURRENT_WEB_MOUNT_REFUSED", "RUNNING_CODEX_IMAGE_ID_MISMATCH", "PUBLIC_WEB_VERSION_MISMATCH",
+    "RELEASE_STATUS_RECORD_INVALID",
+    "RELEASE_RECEIPT_ORDER_UNCERTAIN",
 })
 RECEIVER_FAILURE_PHASES = frozenset({
     "protocol", "stage-registry-pull", "stage-relay-download", "stage-validate", "stage-load-images",
     "validate-artifacts", "maintenance", "migration", "activate", "verify", "rollback",
+    "candidate-preflight", "drain", "worker-stop", "release-status",
+    "receive", "registry-pull", "relay-download", "load-images",
+})
+RECEIVER_CAUSE_CODES = RECEIVER_FAILURE_CODES | frozenset({
+    "API_SHUTDOWN_INCOMPLETE", "API_DRAIN_STOP_FAILED", "FORCE_RESUME_ACTIVE_WORK",
+    "ROLLBACK_HEALTH_NOT_RESTORED", "MIGRATION_FAILED", "PRIVATE_COMMAND_FAILED",
 })
 
 
@@ -246,6 +266,14 @@ def receiver_failure(output):
     return code, phase
 
 
+def receiver_cause(output):
+    """Only an explicitly enumerated reason can cross the private log boundary."""
+    if receiver_failure(output) is None:
+        return None
+    cause = json.loads(output).get("causeCode")
+    return cause if isinstance(cause, str) and cause in RECEIVER_CAUSE_CODES else None
+
+
 def read_with_open_input(process, timeout=5400):
     """Keep stdin alive; its EOF is the remote receiver's cancellation signal."""
     output = bytearray()
@@ -255,7 +283,7 @@ def read_with_open_input(process, timeout=5400):
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise Failure(44)
+                raise TransportFailure(44)
             for key, _ in selector.select(min(remaining, 5)):
                 chunk = os.read(key.fileobj.fileno(), 8192)
                 if not chunk:
@@ -291,12 +319,13 @@ def remote(ssh, child, log, request, payload=None):
         else:
             process.stdin.close()
             process.stdin = None
-            output, _ = process.communicate(timeout=5400)
+            output, _ = process.communicate(timeout=60 if request.get("action") == "release-status" else 5400)
         if process.returncode or len(output) > 128 * 1024:
             if process.returncode:
                 failure = receiver_failure(output) if len(output) <= 128 * 1024 else None
                 if failure:
-                    message = "Tencent Production: receiver refused (" + failure[0] + ", " + failure[1] + ")."
+                    cause = receiver_cause(output)
+                    message = "Tencent Production: receiver refused (" + failure[0] + ", " + failure[1] + (", " + cause if cause else "") + ")."
                     status(message)
                     log.write((message + "\n").encode())
                 log.flush()
@@ -312,15 +341,81 @@ def remote(ssh, child, log, request, payload=None):
                                           (b"network is unreachable", "network-unreachable")):
                     if pattern in diagnostic:
                         status("Tencent Production: SSH failed (" + category + ").")
-                        break
+                        if category in ("connection-timeout", "connection-refused", "network-unreachable"):
+                            raise TransportFailure(44)
+                        raise Failure(44)
+                if process.returncode == 255 and not failure:
+                    raise TransportFailure(44)
             raise Failure(44)
-        result = json.loads(output)
+        try:
+            result = json.loads(output)
+        except (ValueError, UnicodeDecodeError):
+            # Empty/truncated observation is not proof of a failed deployment.
+            raise TransportFailure(44) from None
         if not isinstance(result, dict):
-            raise Failure(44)
+            raise TransportFailure(44)
         return result
+    except (subprocess.TimeoutExpired, ConnectionError):
+        stop_process(process)
+        raise TransportFailure(44) from None
     except BaseException:
         stop_process(process)
         raise
+
+
+def original_release_status(ssh, child, log, base, *, previous_ticket=None, metadata=None):
+    """Reconnect only a read. Never repeat stop, migration, or activation after EOF."""
+    request = {key: base[key] for key in ("sourceSha", "version")}
+    request["action"] = "release-status"
+    if previous_ticket is not None:
+        request["previousTransferTicket"] = previous_ticket
+    else:
+        request.update(bundleBytes=metadata["bytes"], bundleSha256=metadata["sha256"])
+    for attempt in range(3):
+        try:
+            result = remote(ssh, child, log, request)
+            if (isinstance(result, dict) and result.get("status") == "release_status" and
+                    result.get("state") == "pending" and result.get("ownerActive") is True and attempt < 2):
+                status("Tencent Production: observing bounded cleanup of the previous operation.")
+                time.sleep(1 << attempt)
+                continue
+            break
+        except TransportFailure:
+            if attempt == 2:
+                raise
+            status("Tencent Production: reconnecting read-only release status.")
+            time.sleep(1 << attempt)
+    if (result.get("status") != "release_status" or
+            result.get("sourceSha") != base["sourceSha"] or result.get("version") != base["version"] or
+            result.get("state") not in ("deployed", "pending", "staged", "absent", "failed") or
+            type(result.get("recoveryRequired")) is not bool or
+            type(result.get("bundleBytes")) is not int or not 0 < result["bundleBytes"] <= 5 * 1024**3 or
+            not isinstance(result.get("bundleSha256"), str) or
+            not re.fullmatch(r"[0-9a-f]{64}", result["bundleSha256"])):
+        raise Failure(47)
+    if metadata is not None and (result["bundleBytes"] != metadata["bytes"] or
+                                 result["bundleSha256"] != metadata["sha256"]):
+        raise Failure(47)
+    if result["state"] == "pending" or result.get("recoveryRequired") is True:
+        status("Tencent Production: previous operation requires reconciliation; no stop or migration repeated.")
+        raise Failure(48)
+    if result["state"] == "deployed":
+        if not isinstance(result.get("verification"), dict) or result["verification"].get("healthy") is not True:
+            raise Failure(44)
+    return result
+
+
+def apply_original_package(ssh, child, log, request):
+    try:
+        return remote(ssh, child, log, request)
+    except TransportFailure:
+        status("Tencent Production: deployment response lost; checking the same immutable package.")
+        result = original_release_status(ssh, child, log, request,
+            metadata={"bytes": request["bundleBytes"], "sha256": request["bundleSha256"]})
+        if result["state"] != "deployed":
+            status("Tencent Production: deployment not confirmed; resume the original package after recovery.")
+            raise Failure(48)
+        return dict(result, status="deployed")
 
 
 def digest(path):
@@ -509,6 +604,27 @@ def execute(env):
             with (private / "private.log").open("w+b", buffering=0) as log:
                 sha, version = requested or env["GITHUB_SHA"], "0.0.125"
                 try:
+                    source_loaded = False
+                    # A pending remote operation can reject ordinary verify.
+                    # Authenticate the exact source and inspect its original
+                    # package before considering any new mutating operation.
+                    # The historical initial-activation gate retains its own
+                    # stricter verify-first path.
+                    if operation == "resume" and requested != INITIAL_SOURCE_SHA:
+                        status("Tencent Production: checking trusted original-package source.")
+                        token = installation_token(SOURCE, permission="read")
+                        clone_source(requested, token, source, child, log)
+                        version = json.loads((source / "package.json").read_text())["version"]
+                        version_tuple(version)
+                        report_version = version
+                        source_loaded = True
+                        recovery = original_release_status(ssh, child, log,
+                            {"sourceSha": requested, "version": version},
+                            previous_ticket=env["TENCENT_PREVIOUS_TRANSFER_TICKET"])
+                        if recovery["state"] == "deployed":
+                            outcome = "success"
+                            status("Tencent Production: original package already deployed and verified; no mutation repeated.")
+                            return
                     status("Tencent Production: checking target.")
                     target = remote(ssh, child, log, {"action": "verify", "sourceSha": sha, "version": version})
                     initial = initial_activation(operation, requested, target)
@@ -517,15 +633,16 @@ def execute(env):
                     if (target.get("status") != "verified" or target.get("configValid") is not True or
                             (target.get("healthy") is not True and not (operation == "stage" and bootstrap) and not initial)):
                         raise Failure(44)
-                    status("Tencent Production: checking trusted private source.")
-                    token = installation_token(SOURCE, permission="read")
-                    sha = requested or github_request(token, "GET", f"/repos/{SOURCE}/commits/main")["sha"]
-                    if not SHA.fullmatch(sha):
-                        raise Failure(41)
-                    clone_source(sha, token, source, child, log)
-                    version = json.loads((source / "package.json").read_text())["version"]
-                    version_tuple(version)
-                    report_version = version
+                    if not source_loaded:
+                        status("Tencent Production: checking trusted private source.")
+                        token = installation_token(SOURCE, permission="read")
+                        sha = requested or github_request(token, "GET", f"/repos/{SOURCE}/commits/main")["sha"]
+                        if not SHA.fullmatch(sha):
+                            raise Failure(41)
+                        clone_source(sha, token, source, child, log)
+                        version = json.loads((source / "package.json").read_text())["version"]
+                        version_tuple(version)
+                        report_version = version
                     # The legacy COS bundle contains only the three original
                     # images. Reject an opted-in source before recording an
                     # attempt or creating any deployment/transfer. Resume
@@ -606,7 +723,7 @@ def execute(env):
                             raise Failure(40)
                     status("Tencent Production: staging private package." if operation == "stage" else
                            "Tencent Production: applying and verifying release.")
-                    result = remote(ssh, child, log, dict(base, action="stage" if operation == "stage" else "deploy",
+                    result = (remote if operation == "stage" else apply_original_package)(ssh, child, log, dict(base, action="stage" if operation == "stage" else "deploy",
                                                         bundleBytes=metadata["bytes"], bundleSha256=metadata["sha256"],
                                                         transferTicket=identity))
                     if (result.get("status") != ("staged" if operation == "stage" else "deployed") or

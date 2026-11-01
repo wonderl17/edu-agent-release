@@ -42,7 +42,7 @@ trusted_bootstrap()
 spec=importlib.util.spec_from_file_location('synthetic_base',HERE/'verify_api_drain_systemd.py')
 base=importlib.util.module_from_spec(spec);spec.loader.exec_module(base)
 check=base.check;call=base.call;wait_path=base.wait_path
-CASES=('normal','cancel','cancel-during','dispatch-lost','caller-before','caller-during','watchdog-during','stop-lost','cookie-window')
+CASES=('normal','cancel','cancel-during','dispatch-lost','caller-before','caller-during','watchdog-during','stop-lost','bounded-entry')
 TEST_PREFIX='teaching-drain-fixture-'
 
 
@@ -70,10 +70,9 @@ def load_fixture(root):
     return module
 
 
-def prepare(root,full_window=False):
+def prepare(root):
     check(root.is_relative_to(base.BASE)and not str(root).startswith('/opt/teaching-ai-production/'),'FIXTURE_SCOPE_REFUSED')
     source=(root/'api_drain_source.py').read_text()
-    check(not full_window or source.count('COOKIE_GRACE_SECONDS=125')==1,'FIXTURE_COOKIE_WINDOW_REFUSED')
     substitutions={
       "DOCKER=['/usr/bin/docker','--host','unix:///var/run/docker.sock']":"DOCKER=["+repr(base.PYTHON)+","+repr(str(root/'fake-docker.py'))+"]",
       "JOURNAL=Path('/opt/teaching-ai-production/operations/release/state/api-drain.pending.json')":"JOURNAL=Path("+repr(str(root/'journal.json'))+")",
@@ -82,7 +81,6 @@ def prepare(root,full_window=False):
       "deadline=time.monotonic()+90":"deadline=time.monotonic()+15",
       "teaching-api-drain-":TEST_PREFIX,
     }
-    if not full_window:substitutions["COOKIE_GRACE_SECONDS=125"]="COOKIE_GRACE_SECONDS=2"
     for old,new in substitutions.items():
         expected=5 if old=='teaching-api-drain-'else 2 if old=='deadline=time.monotonic()+90'else 1
         check(source.count(old)==expected,'FIXTURE_SUBSTITUTION_REFUSED')
@@ -126,12 +124,12 @@ def caller(root,case):
         if cancel[0]or case=='cancel-during'and(root/'cancel-requested').exists():raise ValueError('synthetic-cancel')
     try:
         started=time.monotonic()
-        with module.Fence(api,check_cancel=check_cancel,wait_seconds=8,fenced_wait_seconds=180 if case=='cookie-window'else 10)as fence:
+        with module.Fence(api,check_cancel=check_cancel)as fence:
             elapsed=time.monotonic()-started
             store(root/'checkpoint.json',{'tag':fence.tag,'case':case,'entrySeconds':elapsed})
             if case=='caller-before':time.sleep(120)
             if case=='cancel':cancel[0]=True
-            if case!='cookie-window':fence.stop()
+            if case!='bounded-entry':fence.stop()
         store(root/'caller-result.json',{'case':case,'status':'complete'})
     except Exception as error:
         store(root/'caller-result.json',{'case':case,'status':'error','type':type(error).__name__})
@@ -172,11 +170,10 @@ def run_test(root,identifier):
         inode=os.stat(f'/proc/{anchor.pid}/ns/net').st_ino
         check(inode!=os.stat('/proc/1/ns/net').st_ino,'FIXTURE_NAMESPACE_REFUSED')
         base.write(root,'server',{'pid':anchor.pid,'start':base.starttime(anchor.pid),'inode':inode})
-        results=[];cookie_elapsed=None;selected=base.read(root,'selected.json')
+        results=[];entry_elapsed=None;selected=base.read(root,'selected.json')
         check(isinstance(selected,list)and selected and len(selected)==len(set(selected))and all(case in CASES for case in selected),
               'FIXTURE_CASE_SELECTION')
-        check('cookie-window'not in selected or selected==['cookie-window'],'FIXTURE_CASE_SELECTION')
-        prepare(root,full_window=selected==['cookie-window'])
+        prepare(root)
         for case in selected:
             for item in ('checkpoint.json','caller-result.json','stop-count','stop-started','api.json','mode','cancel-requested'):
                 (root/item).unlink(missing_ok=True)
@@ -186,11 +183,11 @@ def run_test(root,identifier):
             call([base.SYSTEMD_RUN,'--quiet','--unit='+caller_unit,'--slice=system.slice',
                   '--property=RuntimeMaxSec=240s',base.PYTHON,str(root/'experiment-helper.py'),'caller',identifier,case])
             if case=='dispatch-lost':wait_path(root/'caller-result.json',30)
-            else:wait_path(root/'checkpoint.json',210 if case=='cookie-window'else 25)
-            if case=='cookie-window':
+            else:wait_path(root/'checkpoint.json',25)
+            if case=='bounded-entry':
                 checkpoint=json.loads((root/'checkpoint.json').read_text())
-                check(checkpoint['entrySeconds']>=125,'FIXTURE_COOKIE_WINDOW_TOO_SHORT')
-                cookie_elapsed=round(checkpoint['entrySeconds'],2)
+                check(checkpoint['entrySeconds']<25,'FIXTURE_BOUNDED_ENTRY_TOO_SLOW')
+                entry_elapsed=round(checkpoint['entrySeconds'],2)
             if case=='caller-before':
                 call([base.SYSTEMCTL,'kill','--kill-whom=all','--signal=SIGKILL',caller_unit])
             elif case=='cancel-during':
@@ -205,7 +202,7 @@ def run_test(root,identifier):
                 target=caller_unit if case=='caller-during'else json.loads((root/'checkpoint.json').read_text())['tag']+'.service'
                 check(target==caller_unit or re.fullmatch(TEST_PREFIX+r'[0-9a-f]{32}\.service',target),'FIXTURE_UNIT_REFUSED')
                 call([base.SYSTEMCTL,'kill','--kill-whom=all','--signal=SIGKILL',target])
-            if case in ('normal','cancel','cancel-during','dispatch-lost','caller-before','cookie-window'):
+            if case in ('normal','cancel','cancel-during','dispatch-lost','caller-before','bounded-entry'):
                 deadline=time.monotonic()+30
                 while (root/'journal.json').exists()and time.monotonic()<deadline:time.sleep(.2)
                 check(not(root/'journal.json').exists(),'FIXTURE_CLEANUP_TIMEOUT')
@@ -229,8 +226,8 @@ def run_test(root,identifier):
             call([base.SYSTEMCTL,'reset-failed',caller_unit],allow_failure=True)
             results.append(case)
         print(json.dumps({'status':'passed','cases':results,'fakeDockerOnly':True,'syntheticNamespaceOnly':True,
-                          'cookieGraceSecondsInFixture':125 if selected==['cookie-window']else 2,'parentDeathGraceSecondsInFixture':2,
-                          'cookieWindowEntrySeconds':cookie_elapsed,'realDockerDaemonTested':False,'businessTasksRun':0,'modelCalls':0}),flush=True)
+                          'tcpIdleWaitSeconds':0,'parentDeathGraceSecondsInFixture':2,
+                          'boundedEntrySeconds':entry_elapsed,'realDockerDaemonTested':False,'businessTasksRun':0,'modelCalls':0}),flush=True)
     finally:
         try:clean_case(root,identifier)
         finally:
@@ -293,7 +290,7 @@ def main():
     check(len(sys.argv)>=2,'FIXTURE_ARGUMENTS')
     if sys.argv[1]=='launch':
         check(len(sys.argv)in (3,4),'FIXTURE_ARGUMENTS')
-        launch(sys.argv[2],[sys.argv[3]]if len(sys.argv)==4 else [case for case in CASES if case!='cookie-window']);return
+        launch(sys.argv[2],[sys.argv[3]]if len(sys.argv)==4 else list(CASES));return
     check(len(sys.argv)>=3,'FIXTURE_ARGUMENTS');identifier=sys.argv[2];root=base.context(identifier)
     if sys.argv[1]=='run':check(len(sys.argv)==3,'FIXTURE_ARGUMENTS');run_test(root,identifier);return
     if sys.argv[1]=='cleanup':check(len(sys.argv)==3,'FIXTURE_ARGUMENTS');cleanup(root,identifier);return
