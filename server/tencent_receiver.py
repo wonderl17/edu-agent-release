@@ -27,6 +27,9 @@ ROOT=Path('/opt/teaching-ai-production');OPS=ROOT/'operations/release'
 RELEASES=ROOT/'releases';OVERRIDE=OPS/'compose.release.yaml';STATE=OPS/'state'
 PROJECT='teaching-production'
 PROTOCOL='teaching-production-ci-v1';SOURCE='shukezhinao/edu-agent'
+FORCE_RESUME_SHA='4fbca8ac76563088319f03645150be6e96528d7c'
+FORCE_RESUME_VERSION='0.0.133'
+FORCE_PREVIOUS_SHA='c321ebfbaaa51afc062055d5875ee860487c6883'
 MAX_BUNDLE=8*1024**3;MAX_DIAGNOSTICS=5*1024**2;MAX_IMAGES=32*1024**3;MAX_WEB=512*1024**2
 MAX_RELAY=5*1024**3
 DOCKER=['/usr/bin/docker','--host','unix:///var/run/docker.sock']
@@ -374,12 +377,40 @@ def api_drain_module():
  require(callable(getattr(module,'Fence',None)),'API_DRAIN_HELPER_REQUIRED')
  return module
 
-def stop_api_guarded(api,on_stop=lambda:None):
+def claim_force_resume(h,value,api,registry):
+ path=STATE/'api-force-stop-once.json'
+ if not(path.exists()or path.is_symlink()):return None
+ private(path);info=path.lstat();require(info.st_nlink==1 and info.st_size<=4096,'FORCE_RESUME_AUTH_REFUSED')
+ auth=decode(path.read_bytes())
+ expected={'schemaVersion','action','nonce','bootId','sourceSha','version','bundleSha256','bundleBytes','previousTicketSha256','previousSourceSha','apiId','apiImage','apiStartedAt','expiresAt'}
+ require(isinstance(auth,dict)and set(auth)==expected and type(auth['schemaVersion'])is int and auth['schemaVersion']==1 and
+         auth['action']=='one-shot-resume-force-stop'and re.fullmatch('[0-9a-f]{32}',auth['nonce']) and
+         h['sourceSha']==FORCE_RESUME_SHA and h['version']==FORCE_RESUME_VERSION and
+         value['buildSha']==FORCE_PREVIOUS_SHA and auth['sourceSha']==h['sourceSha']and auth['version']==h['version']and
+         type(auth['bundleBytes'])is int and auth['bundleBytes']==h['bundleBytes'] and
+         auth['bundleSha256']==h['bundleSha256'] and
+         auth['previousSourceSha']==value['buildSha']and auth['bootId']==process_identity()['bootId']and
+         auth['apiId']==api['Id']and auth['apiImage']==api['Image']and auth['apiStartedAt']==api['State']['StartedAt']and
+         type(auth['expiresAt'])is int and time.time()<auth['expiresAt']<=time.time()+1800 and
+         isinstance(registry,dict)and registry.get('transport')=='registry'and
+         registry.get('bundleBytes')==auth['bundleBytes']and registry.get('bundleSha256')==auth['bundleSha256']and
+         re.fullmatch('[0-9a-f]{32}',registry.get('previousTransferTicket','')) and
+         isinstance(auth['previousTicketSha256'],str) and re.fullmatch('[0-9a-f]{64}',auth['previousTicketSha256']) and
+         hashlib.sha256(registry['previousTransferTicket'].encode()).hexdigest()==auth['previousTicketSha256'],
+         'FORCE_RESUME_AUTH_REFUSED')
+ claimed=STATE/('api-force-stop-used-'+auth['nonce']+'.json')
+ require(not(claimed.exists()or claimed.is_symlink()),'FORCE_RESUME_AUTH_USED')
+ os.rename(path,claimed);sync_directory(STATE)
+ return {'expiresAt':auth['expiresAt'],'nonce':auth['nonce']}
+
+def stop_api_guarded(api,on_stop=lambda:None,force_expires_at=None,pre_stop=lambda:None,on_request=lambda:None):
  helper=api_drain_module()
  def check_cancel():
   if client_cancelled.is_set()and not rolling_back:raise Refused(client_reason or'CLIENT_DISCONNECTED')
  try:
-  with helper.Fence(api,check_cancel=check_cancel)as fence:
+  with helper.Fence(api,check_cancel=check_cancel,force_expires_at=force_expires_at)as fence:
+   pre_stop()
+   on_request()
    fence.stop(on_stop)
  except helper.DrainError as error:raise Refused(str(error))from None
 def current():
@@ -510,11 +541,13 @@ def relay_download(h,bundle):
  result=transfer_helper('download',payload)
  require(result.get('status')=='downloaded'and result.get('bytes')==h['bundleBytes']and result.get('sha256')==h['bundleSha256'],'TRANSFER_DOWNLOAD_RECEIPT_MISMATCH')
  private(bundle);require(bundle.stat().st_size==h['bundleBytes']and hash_file(bundle)==h['bundleSha256'],'TRANSFER_DOWNLOAD_HASH_MISMATCH')
+def queue_state(general):
+ output=command(DOCKER+['exec','-i',general['Id'],'node','--input-type=module'],timeout=25,data=(OPS/'queue-probe.mjs').read_bytes())
+ return decode(output)
 def drain(general):
  deadline=time.monotonic()+900
  while True:
-  output=command(DOCKER+['exec','-i',general['Id'],'node','--input-type=module'],timeout=25,data=(OPS/'queue-probe.mjs').read_bytes())
-  value=decode(output)
+  value=queue_state(general)
   if value.get('idle'):return value
   require(time.monotonic()<deadline,'ACTIVE_WORK_DRAIN_TIMEOUT');time.sleep(5)
 def stop_api_for_release(api):
@@ -664,13 +697,22 @@ def deploy(h,stream):
  stopped=False;switched=False;migration_started=False;migration_ok=False
  with ops.maintenance('ci-release-'+h['sourceSha'][:12],minutes=45):
   operation=release_operation_create(h,value,before)
+  forced=None;forced_requested=False;force_intent=False
   try:
    phase='drain'
+   force_path=STATE/'api-force-stop-once.json';force_intent=force_path.exists()or force_path.is_symlink()
+   forced=claim_force_resume(h,value,before['api'],registry)
+   if forced is not None:drain(before['worker-general'])
    operation=release_operation_phase(operation,'api_stop_requested')
    def mark_stopped():
     nonlocal stopped
     stopped=True
-   stop_api_guarded(before['api'],mark_stopped)
+   def verify_forced_queue():
+    if forced is not None:require(queue_state(before['worker-general']).get('idle') is True,'FORCE_RESUME_ACTIVE_WORK')
+   def mark_request():
+    nonlocal forced_requested
+    if forced is not None:forced_requested=True
+   stop_api_guarded(before['api'],mark_stopped,forced['expiresAt'] if forced else None,verify_forced_queue,mark_request)
    operation=release_operation_phase(operation,'api_stopped')
    drain(before['worker-general'])
    phase='worker-stop'
@@ -681,7 +723,7 @@ def deploy(h,stream):
    phase='activate';operation=release_operation_phase(operation,'activation_started');switched=True;atomic(OVERRIDE,candidate);ops.preflight();up_four()
    phase='verify';operation=release_operation_phase(operation,'verification_started');verification=postflight(h,m,before,image_proofs)
    finish_liveness()
-   result={'status':'deployed','version':h['version'],'sourceSha':h['sourceSha'],'snapshotId':snapshot_id,'backupPolicy':'mac-direct-daily-no-pre-release-backup','verification':verification,'deployedAt':utc(),'sourceRepository':SOURCE}
+   result={'status':'deployed','version':h['version'],'sourceSha':h['sourceSha'],'snapshotId':snapshot_id,'backupPolicy':'mac-direct-daily-no-pre-release-backup','verification':verification,'deployedAt':utc(),'sourceRepository':SOURCE,'apiShutdown':{'mode':'forced','approval':'claimed','requestAttempted':forced_requested,'stopConfirmed':stopped,'outcome':'confirmed','exitCode':137,'approvalId':forced['nonce']} if forced else {'mode':'graceful','exitCode':0}}
    atomic(STATE/'last-success.json',result);atomic(target/'deployment-receipt.json',result);release_operation_clear(operation)
   except Exception as error:
    rolling_back=True
@@ -701,6 +743,11 @@ def deploy(h,stream):
     release_operation_clear(operation)
    except Exception as rollback_error:rollback_ok=False;rollback_cause=str(rollback_error)if isinstance(rollback_error,Refused)else type(rollback_error).__name__
    result={'status':'failed','code':'DEPLOY_FAILED_ROLLBACK_RESTORED'if rollback_ok else'DEPLOY_FAILED_ROLLBACK_INCOMPLETE','causeCode':str(error)if isinstance(error,Refused)else type(error).__name__,'rollbackCauseCode':rollback_cause,'phase':phase_before_rollback,'version':h['version'],'sourceSha':h['sourceSha'],'snapshotId':snapshot_id,'configurationRollbackSucceeded':rollback_ok,'databaseAutomaticallyRestored':False,'migrationStarted':migration_started,'migrationSucceeded':migration_ok,'manualDatabaseReviewRequired':migration_started,'failedAt':utc()}
+   if force_intent:
+    result['apiShutdown']={'mode':'forced','approval':'claimed' if forced else 'claim_not_confirmed',
+     'requestAttempted':forced_requested,'stopConfirmed':stopped,
+     'outcome':'confirmed' if stopped else 'unknown' if forced_requested else 'not_requested',
+     **({'approvalId':forced['nonce']} if forced else {})}
    atomic(STATE/'last-failure.json',result);atomic(run_dir/'failure-receipt.json',result);return result
  return result
 def stage(h,stream):

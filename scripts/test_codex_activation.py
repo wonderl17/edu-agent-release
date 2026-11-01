@@ -322,7 +322,9 @@ class ActivationTests(unittest.TestCase):
                 def __init__(self,api,*args,**kwargs):self.api=api
                 def __enter__(self):return self
                 def __exit__(self,*args):pass
-                def stop(self,on_stopped):on_stopped();receiver.stop_api_for_release(self.api)
+                def stop(self,on_stopped):
+                    if fail=='stop-uncertain':raise ValueError('API_DRAIN_STOP_UNCERTAIN')
+                    on_stopped();receiver.stop_api_for_release(self.api)
             stack.enter_context(patch.object(receiver,'api_drain_module',return_value=types.SimpleNamespace(Fence=FakeFence,DrainError=ValueError)))
             stack.enter_context(patch.object(receiver.shutil,'disk_usage',return_value=types.SimpleNamespace(free=10**12)))
             stack.enter_context(patch.object(receiver.time,'monotonic',side_effect=[0,181]))
@@ -334,13 +336,16 @@ class ActivationTests(unittest.TestCase):
                 return
             result=receiver.deploy(header,io.BytesIO())
             if fail:
-                if fail in ('migration','worker-shutdown'):
+                if fail in ('migration','worker-shutdown','stop-uncertain'):
                     self.assertEqual(result['status'],'failed');self.assertFalse(result['configurationRollbackSucceeded'])
                     self.assertEqual(result['code'],'DEPLOY_FAILED_ROLLBACK_INCOMPLETE')
                     self.assertEqual(result['rollbackCauseCode'],'API_DRAIN_MANUAL_RECOVERY_REQUIRED')
                     self.assertFalse(any(isinstance(e,tuple)and e[0]=='command'and 'start'in e[1]for e in events))
                     self.assertFalse(any(isinstance(e,tuple)and e[0]=='override'for e in events))
                     self.assertEqual(override.read_bytes(),previous)
+                    if fail=='stop-uncertain':
+                        self.assertNotIn('migration',events)
+                        self.assertFalse(any(isinstance(e,tuple)and e[0]=='command'and 'stop'in e[1]for e in events))
                     return
                 if fail.startswith('rollback-'):
                     self.assertEqual(json.loads(override.read_bytes()),expected)
@@ -381,6 +386,7 @@ class ActivationTests(unittest.TestCase):
     def test_success_activates_the_same_preflighted_candidate(self): self.deployment()
     def test_failed_migration_retains_manual_recovery_marker(self): self.deployment('migration')
     def test_unclean_api_exit_restores_original_services_before_queue_drain_or_migration(self): self.deployment('shutdown')
+    def test_uncertain_api_stop_retains_manual_recovery_and_never_migrates(self): self.deployment('stop-uncertain')
     def test_unclean_worker_exit_retains_manual_recovery_marker(self): self.deployment('worker-shutdown')
     def test_failed_migration_does_not_claim_recovery_for_unhealthy_old_services(self): self.deployment('migration',rollback_healthy=False)
     def test_failed_activation_restores_exact_prior_override_and_health(self): self.deployment('postflight')
