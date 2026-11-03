@@ -58,8 +58,9 @@ def atomic(path,value):
 def header(stream):
  raw=stream.readline(16385);require(len(raw)<=16384 and raw.endswith(b'\n'),'HEADER_LIMIT_OR_TERMINATOR')
  h=decode(raw);require(isinstance(h,dict),'HEADER_OBJECT_REQUIRED')
- action=h.get('action');require(action in('verify','release-status','record-attempt','deploy','stage','diagnostics','prepare-transfer','prepare-registry','resume-transfer'),'ACTION_REFUSED')
+ action=h.get('action');require(action in('verify','build-preflight','release-status','record-attempt','deploy','stage','diagnostics','prepare-transfer','prepare-registry','resume-transfer'),'ACTION_REFUSED')
  expected={'protocol','action','sourceRepository','sourceSha','version'}
+ if action=='build-preflight':expected.add('backend')
  if action in('deploy','stage','diagnostics','prepare-transfer','prepare-registry'):expected|={'bundleBytes','bundleSha256'}
  if action in('deploy','stage'):expected.add('clientKeepsInputOpen')
  if action in('deploy','stage')and'transferTicket'in h:expected.add('transferTicket')
@@ -72,6 +73,7 @@ def header(stream):
  if action in('deploy','stage','record-attempt','prepare-transfer','prepare-registry','resume-transfer')and('allowSameVersionSourceChange'in h or'expectedCurrentSourceSha'in h):expected|={'allowSameVersionSourceChange','expectedCurrentSourceSha'}
  if action=='diagnostics'and'runId'in h:expected.add('runId')
  require(set(h)==expected and h.get('protocol')==PROTOCOL,'PROTOCOL_OR_FIELDS_REFUSED')
+ if action=='build-preflight':require(h.get('backend')in('cnb','cos'),'BUILD_BACKEND_REFUSED')
  if action in('deploy','stage'):require(h.get('clientKeepsInputOpen')is True,'CLIENT_LIVENESS_REQUIRED')
  if'transferTicket'in h:require(isinstance(h['transferTicket'],str)and re.fullmatch('[0-9a-f]{32}',h['transferTicket']),'TRANSFER_TICKET_REFUSED')
  if'previousTransferTicket'in h:require(isinstance(h['previousTransferTicket'],str)and re.fullmatch('[0-9a-f]{32}',h['previousTransferTicket']),'TRANSFER_TICKET_REFUSED')
@@ -575,6 +577,17 @@ def initial_handler():
  path=OPS/'initial-activation.py';private(path)
  spec=importlib.util.spec_from_file_location('production_initial_activation',path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
  return module,module.Context(globals())
+def require_release_disk(bundle_bytes):
+ required=MAX_IMAGES+bundle_bytes+MAX_WEB+2*1024**3
+ available=shutil.disk_usage(OPS).free
+ require(available>=required,'INSUFFICIENT_RELEASE_DISK')
+ return{'status':'build_ready','availableBytes':available,'requiredBytes':required}
+def build_preflight(h):
+ global phase
+ phase='build-preflight'
+ # Registry manifests are bounded to 12000 bytes by tencent_registry.prepare;
+ # COS transfers are bounded by MAX_RELAY. No build size is guessed here.
+ return require_release_disk(12000 if h['backend']=='cnb'else MAX_RELAY)
 def verify(h):
  if ops.fixed_env()['PRODUCTION_ACTIVATED']=='false':
   ready=ops.bootstrap_ready();ready['initialActivationReady']=False
@@ -905,7 +918,7 @@ def deploy(h,stream):
  require('initialGateId'not in h,'INITIAL_GATE_ON_ACTIVE_RUNTIME_REFUSED')
  value,before=current();version_policy(h,value)
  staging=OPS/'incoming';staging.mkdir(mode=0o700,exist_ok=True);run_dir=staging/(h['sourceSha']+'-'+uuid.uuid4().hex[:12]);run_dir.mkdir(mode=0o700)
- require(shutil.disk_usage(OPS).free>=MAX_IMAGES+h['bundleBytes']+MAX_WEB+2*1024**3,'INSUFFICIENT_RELEASE_DISK')
+ require_release_disk(h['bundleBytes'])
  handler,context=registry_handler();registry=handler.ticket(context,h)
  if registry:
   phase='registry-pull';m,web,web_info,image_proofs=handler.pull(context,h,stream,registry)
@@ -1006,7 +1019,7 @@ def stage(h,stream):
  else:
   value,before=current();version_policy(h,value)
  staging=OPS/'incoming';staging.mkdir(mode=0o700,exist_ok=True);run_dir=staging/(h['sourceSha']+'-'+uuid.uuid4().hex[:12]);run_dir.mkdir(mode=0o700)
- require(shutil.disk_usage(OPS).free>=MAX_IMAGES+h['bundleBytes']+MAX_WEB+2*1024**3,'INSUFFICIENT_RELEASE_DISK')
+ require_release_disk(h['bundleBytes'])
  handler,context=registry_handler();registry=handler.ticket(context,h)
  if registry:
   phase='stage-registry-pull';m,web,web_info,proofs=handler.pull(context,h,stream,registry)
@@ -1043,6 +1056,9 @@ def main():
   signal.alarm(45);h=header(stream);initialize(h['action']);signal.alarm(10800 if h['action']in('deploy','stage')else 1830 if h['action']=='resume-transfer'else 180 if h['action']=='prepare-transfer'else 120 if h['action']=='diagnostics'else 45)
   if h['action']=='diagnostics':return diagnostics(h,stream)
   if h['action']=='verify':require(stream.read(1)==b'','PAYLOAD_UNEXPECTED');return verify(h)
+  if h['action']=='build-preflight':
+   require(stream.read(1)==b'','PAYLOAD_UNEXPECTED')
+   with release_lock():return build_preflight(h)
   if h['action']=='release-status':require(stream.read(1)==b'','PAYLOAD_UNEXPECTED');return release_status(h)
   if h['action']=='prepare-registry':
    require(stream.read(1)==b'','PAYLOAD_UNEXPECTED');handler,context=registry_handler();return handler.prepare(context,h)

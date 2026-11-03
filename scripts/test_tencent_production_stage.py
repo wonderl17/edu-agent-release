@@ -40,6 +40,8 @@ class ProductionStageTests(unittest.TestCase):
             if request["action"] == "release-status":
                 return {"status": "release_status", "state": "staged", "sourceSha": self.SOURCE,
                         "version": "0.0.125", "bundleBytes": 7, "bundleSha256": "f" * 64, "recoveryRequired": False}
+            if request["action"] == "build-preflight":
+                return {"status": "build_ready"}
             if request["action"] == "verify":
                 return target_result if target_result is not None else bootstrap
             if request["action"] == "prepare-transfer":
@@ -107,9 +109,9 @@ class ProductionStageTests(unittest.TestCase):
     def test_bootstrap_can_stage_without_recording_cloud_attempt_or_touching_services(self):
         events, calls, records, failure = self.execute_fixture()
         self.assertIsNone(failure)
-        self.assertEqual(events, ["verify", "ancestor", "checkout", "metadata", "build", "prepare-transfer",
+        self.assertEqual(events, ["verify", "ancestor", "checkout", "build-preflight", "metadata", "build", "prepare-transfer",
                                   "upload", "stage", "status-success", "token-revoked"])
-        self.assertEqual([c["action"] for c in calls], ["verify", "prepare-transfer", "stage"])
+        self.assertEqual([c["action"] for c in calls], ["verify", "build-preflight", "prepare-transfer", "stage"])
         self.assertEqual(records[0]["task"], "stage-tencent-production")
         self.assertEqual(records[0]["payload"]["operation"], "tencent-production-stage")
         self.assertFalse(records[0]["production_environment"])

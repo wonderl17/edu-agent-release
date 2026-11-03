@@ -54,6 +54,10 @@ class UnsupportedBuildBackend(Failure):
     """A source/backend combination refused before recording a release attempt."""
 
 
+class BuildPreflightFailure(Failure):
+    """Read-only capacity check refused before a build or release attempt."""
+
+
 def require_supported_build_backend(backend, source):
     if backend not in ("cnb", "cos"):
         raise UnsupportedBuildBackend(40)
@@ -250,7 +254,7 @@ RECEIVER_FAILURE_CODES = frozenset({
 RECEIVER_FAILURE_PHASES = frozenset({
     "protocol", "stage-registry-pull", "stage-relay-download", "stage-validate", "stage-load-images",
     "validate-artifacts", "maintenance", "migration", "activate", "verify", "rollback",
-    "candidate-preflight", "api-shutdown-acceptance", "drain", "worker-stop", "release-status",
+    "candidate-preflight", "build-preflight", "api-shutdown-acceptance", "drain", "worker-stop", "release-status",
     "receive", "registry-pull", "relay-download", "load-images",
 })
 RECEIVER_CAUSE_CODES = RECEIVER_FAILURE_CODES | frozenset({
@@ -685,6 +689,15 @@ def execute(env):
                         outcome = "success"
                         return
                     base = {"sourceSha": sha, "version": version, "initialGateId": target["initialGateId"]} if initial else release_request(operation, sha, version, target)
+                    if operation != "resume":
+                        status("Tencent Production: checking target disk before building.")
+                        try:
+                            capacity = remote(ssh, child, log, {"action": "build-preflight",
+                                "sourceSha": sha, "version": version, "backend": backend})
+                            if capacity.get("status") != "build_ready":
+                                raise Failure(44)
+                        except Failure as error:
+                            raise BuildPreflightFailure(error.code) from None
                     # The initial target has no current Web to record against.
                     # GitHub still records release-cloud, while the root-issued
                     # gate owns its irreversible attempt_started/consumed state.
@@ -780,7 +793,7 @@ def execute(env):
                 except BaseException as error:
                     if isinstance(error, (SystemExit, KeyboardInterrupt)):
                         outcome = "cancelled"
-                    if operation != "verify" and not isinstance(error, (SystemExit, KeyboardInterrupt, UnsupportedBuildBackend)):
+                    if operation != "verify" and not isinstance(error, (SystemExit, KeyboardInterrupt, UnsupportedBuildBackend, BuildPreflightFailure)):
                         try:
                             log.flush()
                             log.seek(max(0, log.seek(0, os.SEEK_END) - 128 * 1024))

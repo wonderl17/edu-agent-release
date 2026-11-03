@@ -62,6 +62,8 @@ class CurrentReleaseRebuildTests(unittest.TestCase):
             actions.append(action)
             self.assertNotIn("PRIVATE_SENTINEL", str(child))
             self.assertNotIn("allowSameVersionSourceChange", request)
+            if action == "build-preflight":
+                return {"status": "build_ready"}
             if action == "verify":
                 return current
             if action == "record-attempt":
@@ -124,7 +126,7 @@ class CurrentReleaseRebuildTests(unittest.TestCase):
     def test_explicit_rebuild_keeps_source_attempt_build_package_deploy_and_result_checks(self):
         actions, failure = self.execute_fixture()
         self.assertIsNone(failure)
-        self.assertEqual(actions, ["verify", "trusted-source", "record-attempt", "deployment-record",
+        self.assertEqual(actions, ["verify", "trusted-source", "build-preflight", "record-attempt", "deployment-record",
                                   "cnb-build", "prepare-registry", "deploy", "status-success", "revoke-token"])
 
     def test_target_identity_must_match_before_any_attempt_or_build(self):
