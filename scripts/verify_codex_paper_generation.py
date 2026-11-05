@@ -165,7 +165,7 @@ console.log(JSON.stringify({status:db.status,error:db.errorMessage,result:db.res
         try:
             app.command(app.compose_argv()+['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '60', 'postgres', 'redis', 'web', 'storage', 'model'], timeout=90)
             require(app.db("const r=await p.$queryRawUnsafe(\"SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema='public'\");console.log(r[0].n)", 'web') == 0, 'FRESH_DATABASE_REQUIRED')
-            app.node("require('child_process').execFileSync('pnpm',['exec','prisma','migrate','deploy'],{stdio:'inherit'})", 'web', timeout=120)
+            app.node("require('child_process').execFileSync(process.execPath,['/app/node_modules/prisma/build/index.js','migrate','deploy'],{stdio:'inherit'})", 'web', timeout=120)
             app.node("const s=require('module').createRequire('/app/apps/api/package.json')('@aws-sdk/client-s3');const c=new s.S3Client({endpoint:process.env.OBJECT_STORAGE_ENDPOINT,region:'us-east-1',forcePathStyle:true,credentials:{accessKeyId:process.env.OBJECT_STORAGE_ACCESS_KEY_ID,secretAccessKey:process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY}});c.send(new s.CreateBucketCommand({Bucket:'paper-proof'})).then(()=>console.log('created'))", 'web')
             app.db("await p.user.create({data:{id:'teacher',email:'synthetic-paper@example.invalid'}});console.log('true')", 'web')
             current = job = seed()

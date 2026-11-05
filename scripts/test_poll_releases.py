@@ -73,6 +73,15 @@ class PollTests(unittest.TestCase):
     def run_poll(self):
         return POLL.poll(self.config, self.environment, self.api, self.token)
 
+    def test_request_identifier_is_only_correlation_and_cannot_select_private_source(self):
+        self.environment['RELEASE_POLL_REQUEST_ID']='d930ce52-a9c1-4ba1-b245-2de6281476ab'
+        self.assertEqual(self.run_poll(),2)
+        self.assertEqual(self.run_poll(),0)
+        self.assertTrue(any(path.endswith('/commits/main') for _,_,path,_ in self.calls))
+        for value in ('a'*40,'main','bad\n::warning::private'):
+            self.environment['RELEASE_POLL_REQUEST_ID']=value
+            with self.assertRaises(POLL.PollFailure):self.run_poll()
+
     def test_dry_run_checks_both_versions_without_dispatch_or_attempt_writes(self):
         self.environment['RELEASE_POLL_DRY_RUN'] = 'true'
         self.assertEqual(self.run_poll(), 2)

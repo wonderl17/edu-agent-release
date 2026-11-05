@@ -1,4 +1,5 @@
 name: Check source versions
+run-name: ${{ inputs.request_id && format('Release check · {0}', inputs.request_id) || 'Check source versions' }}
 
 on:
   schedule:
@@ -9,6 +10,10 @@ on:
         description: Check source access and version eligibility without publishing or advancing cursors
         type: boolean
         default: true
+      request_id:
+        description: Optional random request identifier for a trusted local release check; no source data
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -32,6 +37,7 @@ jobs:
       - name: Check canonical source versions
         env:
           RELEASE_POLL_DRY_RUN: ${{ inputs.dry_run == true && 'true' || 'false' }}
+          RELEASE_POLL_REQUEST_ID: ${{ inputs.request_id }}
           TENCENT_PRODUCTION_AUTOMATIC_ENABLED: ${{ vars.TENCENT_PRODUCTION_AUTOMATIC_ENABLED }}
           PUBLIC_GH_TOKEN: ${{ github.token }}
           PUBLIC_REPOSITORY: ${{ github.repository }}

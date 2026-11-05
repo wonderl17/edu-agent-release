@@ -64,6 +64,9 @@ def compare_versions(left: str, right: str) -> int:
 
 def validate_configuration(config: Any, environment: dict[str, str]) -> list[dict[str, Any]]:
     try:
+        request_id = environment.get("RELEASE_POLL_REQUEST_ID", "")
+        if request_id and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", request_id) is None:
+            raise ValueError()
         sources = config["sources"]
         if not isinstance(sources, list) or not 1 <= len(sources) <= len(ALLOWED_REPOSITORIES):
             raise ValueError()

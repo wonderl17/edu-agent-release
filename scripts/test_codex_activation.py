@@ -330,7 +330,8 @@ class ActivationTests(unittest.TestCase):
                     if fail=='stop-uncertain':raise ValueError('API_DRAIN_STOP_UNCERTAIN')
                     on_stopped();receiver.stop_api_for_release(self.api)
             stack.enter_context(patch.object(receiver,'api_drain_module',return_value=types.SimpleNamespace(Fence=FakeFence,DrainError=ValueError)))
-            stack.enter_context(patch.object(receiver.shutil,'disk_usage',return_value=types.SimpleNamespace(free=10**12)))
+            stack.enter_context(patch.object(receiver,'require_release_disk',return_value={'status':'build_ready'}))
+            stack.enter_context(patch.object(receiver,'admission_scope',return_value=contextlib.nullcontext(None)))
             stack.enter_context(patch.object(receiver.time,'monotonic',side_effect=[0,181]))
             if fail in('candidate','shutdown-acceptance'):
                 with self.assertRaisesRegex(receiver.Refused,'CANDIDATE_REFUSED'if fail=='candidate'else'API_SHUTDOWN_ACCEPTANCE_FAILED'):

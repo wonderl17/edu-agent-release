@@ -15,13 +15,20 @@ const stages = new Set([
   "D_ENTRY", "D_TOOLCHAIN", "D_DEPENDENCIES", "D_CHANGELOG", "D_NODE_CHECK",
   "D_VPK_SETUP", "D_WINDOWS_SETUP", "D_MAC_SIGN", "D_PACKAGE", "D_PREFLIGHT",
   "D_WEB_BUILD", "D_VITE", "D_SIDECAR", "D_ELECTRON", "D_LATEX", "D_PDF",
-  "D_VPK_DOWNLOAD", "D_VPK_PACK", "D_VPK_DELTA", "D_VERIFY", "D_R2_PUBLISH",
+  "D_VPK_DOWNLOAD", "D_VPK_PACK", "D_VPK_DELTA", "D_VERIFY", "D_R2_PUBLISH", "D_R2_STAGE", "D_COS_PUBLISH", "D_GITHUB_PRIVATE_UPLOAD",
   "D_FINAL_PUBLISH", "D_RESUME", "D_TOKEN_REFRESH", "D_CACHE_RESTORE", "D_CACHE_SAVE",
 ]);
 const states = new Set(["start", "success", "failure"]);
 
 function record(stage, state, started = performance.now()) {
   if (!file || !stages.has(stage) || !states.has(state)) return;
+  const scope = ["mac-arm64", "mac-x64", "win-x64"].includes(process.env.DESKTOP_PACK_TARGET) ? process.env.DESKTOP_PACK_TARGET : "all";
+  const elapsed = state === "start" ? 0 : Math.min(10800000, Math.max(0, Math.round(performance.now() - started)));
+  appendRecord(`${stage} ${state} ${scope} ${elapsed}\n`);
+}
+
+function appendRecord(line) {
+  if (!file) return;
   let descriptor;
   let locked = false;
   try {
@@ -31,9 +38,6 @@ function record(stage, state, started = performance.now()) {
     locked = true;
     descriptor = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     const metadata = fs.fstatSync(descriptor);
-    const scope = ["mac-arm64", "mac-x64", "win-x64"].includes(process.env.DESKTOP_PACK_TARGET) ? process.env.DESKTOP_PACK_TARGET : "all";
-    const elapsed = state === "start" ? 0 : Math.min(10800000, Math.max(0, Math.round(performance.now() - started)));
-    const line = `${stage} ${state} ${scope} ${elapsed}\n`;
     if (metadata.isFile() && (metadata.mode & 0o777) === 0o600
         && metadata.uid === process.getuid()) {
       const next = Buffer.from(line);
@@ -82,7 +86,8 @@ function commandStage(command, args) {
     if (args[0] === "changelog:check") return "D_CHANGELOG";
     if (args[0] === "pack:desktop:all") return "D_PACKAGE";
     if (args[0] === "release:desktop:preflight") return "D_PREFLIGHT";
-    if (args[0] === "release:desktop:r2:existing") return "D_R2_PUBLISH";
+    if (args[0] === "release:desktop:r2:existing") return args.includes("--stage-cos-origin") ? "D_R2_STAGE" : args.includes("--cos-origin") ? "D_COS_PUBLISH" : "D_R2_PUBLISH";
+    if (args[0] === "release:desktop:github:existing") return "D_GITHUB_PRIVATE_UPLOAD";
     if (args[0] === "release:desktop:all:existing") return "D_FINAL_PUBLISH";
     if (args[0] === "--filter" && args[1] === "@teaching-ai-agent/web" && args[2] === "build:electron") return "D_WEB_BUILD";
     if (args[0] === "--filter" && args[1] === "@teaching-ai-agent/desktop" && args[2] === "build:sidecar") return "D_SIDECAR";
@@ -160,6 +165,31 @@ if (file) for (const method of ["spawn", "spawnSync"]) {
   };
 }
 syncBuiltinESMExports();
+
+// Observe only the cache CLI's finite result grammar. Its ordinary stdout still
+// goes to the private log; no log file, command arguments, or arbitrary strings
+// are copied to the public diagnostic channel.
+if (file && path.basename(process.argv[1] || "") === "desktop-build-cache.mjs") {
+  const originalWrite = process.stdout.write;
+  const reasons = new Set(["VALIDATED", "NOT_FOUND", "IDENTITY_CHANGED", "INVALID_CACHE", "TRANSFER_FAILED", "ARCHIVE_FAILED", "LOCAL_IO", "CONFIG_UNAVAILABLE", "CONFIG_INVALID", "BASELINE_MATCH", "UPLOADED", "SIZE_LIMIT"]);
+  let pending = "";
+  process.stdout.write = function (chunk, ...args) {
+    try {
+      const value = typeof chunk === "string" ? chunk : Buffer.isBuffer(chunk) ? chunk.toString("utf8") : "";
+      if (value.length <= 512) {
+        pending = (pending + value).slice(-1024);
+        const lines = pending.split("\n"); pending = lines.pop();
+        for (const line of lines) {
+          const match = /^Desktop cache result: mode=(restore|save); status=(hit|miss|unavailable|saved|unchanged); reason=([A-Z_]+)\.$/.exec(line);
+          if (!match || !reasons.has(match[3])) continue;
+          if (match[1] === "restore" ? !["hit", "miss", "unavailable"].includes(match[2]) : !["saved", "unchanged", "unavailable"].includes(match[2])) continue;
+          appendRecord(`CACHE_RESULT ${match[1]} ${match[2]} ${match[3]}\n`);
+        }
+      } else pending = "";
+    } catch {}
+    return originalWrite.call(this, chunk, ...args);
+  };
+}
 
 const ownStage = nodeStage(process.argv[1]);
 const ownStarted = performance.now();

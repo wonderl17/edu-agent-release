@@ -31,6 +31,7 @@ MAX_BUNDLE=8*1024**3;MAX_DIAGNOSTICS=5*1024**2;MAX_IMAGES=32*1024**3;MAX_WEB=512
 MAX_RELAY=5*1024**3
 DOCKER=['/usr/bin/docker','--host','unix:///var/run/docker.sock']
 phase='protocol';run_dir=None;ops=None
+timing_rows=[];timing_started=None;phase_started=None;maintenance_started=None
 client_done=threading.Event();client_cancelled=threading.Event();client_reason=None;monitor_thread=None;rolling_back=False
 
 class Refused(Exception):pass
@@ -55,10 +56,43 @@ def atomic(path,value):
  fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
  with os.fdopen(fd,'wb')as f:f.write(value if isinstance(value,bytes)else(json.dumps(value,sort_keys=True,separators=(',',':'))+'\n').encode());f.flush();os.fsync(f.fileno())
  os.replace(temp,path)
+def sibling_module(name):
+ require(name in('release_capacity','maintenance_gate'),'HELPER_MODULE_REFUSED')
+ path=OPS/(name+'.py');private(path)
+ spec=importlib.util.spec_from_file_location('production_'+name,path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+ return module
+def timing_start():
+ global timing_rows,timing_started,phase_started,maintenance_started
+ timing_rows=[];timing_started=phase_started=time.perf_counter();maintenance_started=None
+def release_phase(name):
+ global phase,phase_started
+ now=time.perf_counter()
+ if timing_started is not None and phase_started is not None:
+  timing_rows.append({'name':phase,'durationMs':min(10800000,max(0,round((now-phase_started)*1000)))})
+ phase=name;phase_started=now
+def timing_summary():
+ if timing_started is None:return None
+ now=time.perf_counter();rows=list(timing_rows)
+ if phase_started is not None:rows.append({'name':phase,'durationMs':min(10800000,max(0,round((now-phase_started)*1000)))})
+ allowed={'release-preflight','registry-pull','receive','relay-download','validate-artifacts','load-images','candidate-preflight',
+  'api-shutdown-acceptance','drain','worker-drain','worker-stop','migration','activate','verify','rollback','stage-registry-pull',
+  'stage-relay-download','stage-validate','stage-load-images','gate-quiesce','gate-await','gate-critical','gate-release'}
+ return{'schemaVersion':1,'phases':[row for row in rows if row['name']in allowed][:64],
+  'totalDurationMs':min(10800000,max(0,round((now-timing_started)*1000))),
+  'maintenanceDurationMs':min(10800000,max(0,round((now-maintenance_started)*1000)))if maintenance_started is not None else 0}
+def attach_timings(result):
+ value=timing_summary()
+ if value is not None:
+  result['timingSummary']=value
+  # Observability must not replace the release or cancellation result.
+  try:
+   if run_dir:atomic(run_dir/'release-timings.json',value)
+  except Exception:pass
+ return result
 def header(stream):
  raw=stream.readline(16385);require(len(raw)<=16384 and raw.endswith(b'\n'),'HEADER_LIMIT_OR_TERMINATOR')
  h=decode(raw);require(isinstance(h,dict),'HEADER_OBJECT_REQUIRED')
- action=h.get('action');require(action in('verify','build-preflight','release-status','record-attempt','deploy','stage','diagnostics','prepare-transfer','prepare-registry','resume-transfer'),'ACTION_REFUSED')
+ action=h.get('action');require(action in('verify','capacity','build-preflight','release-status','record-attempt','deploy','stage','diagnostics','prepare-transfer','prepare-registry','resume-transfer'),'ACTION_REFUSED')
  expected={'protocol','action','sourceRepository','sourceSha','version'}
  if action=='build-preflight':expected.add('backend')
  if action in('deploy','stage','diagnostics','prepare-transfer','prepare-registry'):expected|={'bundleBytes','bundleSha256'}
@@ -313,7 +347,7 @@ def release_lock():
 def initialize(action=None):
  global ops
  require(os.geteuid()==0 and ROOT.resolve()==ROOT and OPS.resolve()==OPS and ROOT.stat().st_uid==0,'TARGET_SCOPE_REFUSED')
- require_host_ready(allow_diagnostics=action in('verify','diagnostics','release-status'))
+ require_host_ready(allow_diagnostics=action in('verify','capacity','diagnostics','release-status'))
  private(OPS/'receiver.py');private(ROOT/'operations/startup/production-ops.py')
  spec=importlib.util.spec_from_file_location('production_ops',ROOT/'operations/startup/production-ops.py');ops=importlib.util.module_from_spec(spec);spec.loader.exec_module(ops)
  ops.fixed_env()
@@ -327,6 +361,10 @@ def require_host_ready(allow_diagnostics=False):
  require(not(marker.exists()or marker.is_symlink()),'API_DRAIN_RECOVERY_REQUIRED')
  marker=STATE/'release-operation.pending.json'
  require(not(marker.exists()or marker.is_symlink()),'RELEASE_OPERATION_RECOVERY_REQUIRED')
+ marker=STATE/'release-admission.pending.json'
+ require(not(marker.exists()or marker.is_symlink()),'RELEASE_ADMISSION_RECOVERY_REQUIRED')
+ marker=STATE/'maintenance-gate.pending.json'
+ require(not(marker.exists()or marker.is_symlink()),'RELEASE_ADMISSION_RECOVERY_REQUIRED')
 
 def process_identity():
  boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
@@ -527,7 +565,7 @@ def release_status(h):
  phase='release-status'
  identity=package_identity(h);result={'status':'release_status',**identity,'state':'absent','recoveryRequired':False}
  operation=optional_record(STATE/'release-operation.pending.json')
- for name in('api-drain.pending.json','release-operation.pending.json','codex-configuration.pending.json'):
+ for name in('api-drain.pending.json','release-operation.pending.json','release-admission.pending.json','maintenance-gate.pending.json','codex-configuration.pending.json'):
   pending=operation if name=='release-operation.pending.json'else optional_record(STATE/name)
   if pending is not None:
    allowed=('prepared','api_stop_requested','api_stopped','worker_stop_requested','workers_stopped','migration_started',
@@ -578,10 +616,85 @@ def initial_handler():
  spec=importlib.util.spec_from_file_location('production_initial_activation',path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
  return module,module.Context(globals())
 def require_release_disk(bundle_bytes):
- required=MAX_IMAGES+bundle_bytes+MAX_WEB+2*1024**3
- available=shutil.disk_usage(OPS).free
- require(available>=required,'INSUFFICIENT_RELEASE_DISK')
- return{'status':'build_ready','availableBytes':available,'requiredBytes':required}
+ value=capacity_report(bundle_bytes)
+ require(value['releaseReady'],'INSUFFICIENT_RELEASE_DISK')
+ return{'status':'build_ready','availableBytes':value['availableBytes'],'requiredBytes':value['requiredBytes'],'capacity':value}
+def capacity_report(bundle_bytes=12000):
+ module=sibling_module('release_capacity')
+ info=decode(command(DOCKER+['info','--format','{{json .DockerRootDir}}'],timeout=15))
+ require(isinstance(info,str)and info.startswith('/')and'\x00'not in info,'CAPACITY_DOCKER_ROOT_INVALID')
+ try:return module.collect_capacity(OPS,Path(info),bundle_bytes)
+ except ValueError:raise Refused('CAPACITY_FILESYSTEM_INVALID')from None
+def admission_request(context,action,**extra):
+ request={key:context[key]for key in('operationId','generation','ownerToken')}
+ try:return context['module'].dispatch(dict(request,action=action,**extra))
+ except context['module'].GateRefused as error:
+  # Raw helper output and the owner token are never receiver/public diagnostics.
+  admission_log_failure(error)
+  raise Refused('RELEASE_ADMISSION_CONTROL_FAILED')from None
+def admission_log_failure(error):
+ code=getattr(error,'code','GATE_CONTROL_FAILED')
+ if not isinstance(code,str)or re.fullmatch('(?:GATE|DEPLOYMENT_ADMISSION)_[A-Z_]{1,80}',code)is None:code='GATE_CONTROL_FAILED'
+ log(('admission-control code='+code+'\n').encode())
+def admission_release(context):
+ if context is None or context.get('released'):return
+ release_phase('gate-release')
+ response=admission_request(context,'release_after_healthy',evidence={
+  'healthy':True,'servicesRestored':True,'migrationReviewRequired':False})
+ require(response.get('status')=='ok'and response.get('state')=='accepting'and response.get('operationId')is None and
+         str(response.get('generation'))==context['generation'],'RELEASE_ADMISSION_RELEASE_UNCONFIRMED')
+ marker=STATE/'release-admission.pending.json';record=optional_record(marker)
+ require(record is not None and all(record.get(key)==context[key]for key in('operationId','generation','ownerToken')),
+         'RELEASE_ADMISSION_OWNER_CHANGED')
+ marker.unlink();sync_directory(marker.parent);context['released']=True
+def admission_quiesce(h):
+ module=sibling_module('maintenance_gate')
+ try:sample=module.dispatch({'action':'status'})
+ except module.GateRefused as error:
+  admission_log_failure(error);raise Refused('RELEASE_ADMISSION_CONTROL_FAILED')from None
+ if sample.get('status')=='unsupported':
+  require(sample.get('code')in('GATE_NOT_INSTALLED','DEPLOYMENT_ADMISSION_DISABLED'),'RELEASE_ADMISSION_CAPABILITY_INVALID')
+  return None
+ capabilities=sample.get('capabilities',{})
+ require(sample.get('status')=='ok'and capabilities.get('protocolVersion')==2 and
+         capabilities.get('reversibleHttpAdmission')is True,'RELEASE_ADMISSION_CAPABILITY_INVALID')
+ try:lease=module.dispatch({'action':'acquire','reason':'release','owner':'ci-release-'+h['sourceSha'][:12]+'-'+uuid.uuid4().hex,
+                           'sourceSha':h['sourceSha'],'version':h['version']})
+ except module.GateRefused as error:
+  admission_log_failure(error);raise Refused('RELEASE_ADMISSION_CONTROL_FAILED')from None
+ require(isinstance(lease,dict)and lease.get('status')=='ok'and isinstance(lease.get('operationId'),str)and
+         re.fullmatch('[A-Za-z0-9_-]{1,128}',lease['operationId'])and isinstance(lease.get('generation'),str)and
+         re.fullmatch('[0-9]{1,20}',lease['generation'])and isinstance(lease.get('ownerToken'),str)and
+         re.fullmatch('[A-Za-z0-9_-]{32,256}',lease['ownerToken']),'RELEASE_ADMISSION_OWNER_INVALID')
+ context={key:lease[key]for key in('operationId','generation','ownerToken')}
+ context.update(module=module,migrationStarted=False,released=False)
+ marker=STATE/'release-admission.pending.json'
+ require(not(marker.exists()or marker.is_symlink()),'RELEASE_ADMISSION_RECOVERY_REQUIRED')
+ try:
+  atomic(marker,{**{key:context[key]for key in('operationId','generation','ownerToken')},
+                 'schemaVersion':1,'sourceSha':h['sourceSha'],'version':h['version'],'phase':'quiescing'})
+  sync_directory(marker.parent)
+  release_phase('gate-quiesce');admission_request(context,'begin_quiesce')
+  release_phase('gate-await');drained=admission_request(context,'await_quiescent',timeoutSeconds=900)
+  require(drained.get('quiescent')is True,'RELEASE_ADMISSION_NOT_QUIESCENT')
+  return context
+ except BaseException:
+  try:admission_release(context)
+  except Exception:pass # Preserve both the owner journal and closed gate for explicit reconciliation.
+  raise
+@contextlib.contextmanager
+def admission_scope(h):
+ context=admission_quiesce(h)
+ failed=False
+ try:yield context
+ except BaseException:
+  failed=True;raise
+ finally:
+  # Pre-migration cancellation/failure may reopen only after the host helper proves actual restored health.
+  if context is not None and not context['released']and not context['migrationStarted']:
+   try:admission_release(context)
+   except Exception:
+    if not failed:raise
 def build_preflight(h):
  global phase
  phase='build-preflight'
@@ -886,7 +999,7 @@ def migration(h,m):
  require('\n'not in env['DATABASE_URL']and'\r'not in env['DATABASE_URL'],'MIGRATION_DATABASE_URL_INVALID')
  filename=run_dir/'migration.env';atomic(filename,('DATABASE_URL='+env['DATABASE_URL']+'\nNODE_ENV=production\nPRISMA_MIGRATE_DEPLOY=false\nPRISMA_DB_PUSH=false\n').encode())
  name=PROJECT+'-migrate-'+h['sourceSha'][:12]+'-'+uuid.uuid4().hex[:8]
- try:command(DOCKER+['run','--rm','--name',name,'--network',PROJECT+'_app','--env-file',str(filename),'--entrypoint','/usr/local/bin/pnpm',m['images']['api']['tag'],'exec','prisma','migrate','deploy','--schema','/app/prisma/schema.prisma'],timeout=600)
+ try:command(DOCKER+['run','--rm','--name',name,'--network',PROJECT+'_app','--env-file',str(filename),'--entrypoint','/usr/local/bin/node',m['images']['api']['tag'],'/app/node_modules/prisma/build/index.js','migrate','deploy','--schema','/app/prisma/schema.prisma'],timeout=600)
  finally:
   filename.unlink(missing_ok=True)
   subprocess.run(DOCKER+['rm','--force',name],capture_output=True,timeout=30,env=ops.fixed_env())
@@ -906,7 +1019,7 @@ def postflight(h,m,before,image_proofs):
  response=decode(command(['/usr/bin/curl','--silent','--show-error','--fail','--max-time','10','http://127.0.0.1:28080/version.json'],timeout=15));require(response.get('version')==h['version']and response.get('buildSha')==h['sourceSha'],'PUBLIC_WEB_VERSION_MISMATCH')
  return{'healthy':True,'version':h['version'],'sourceSha':h['sourceSha'],'workerConsumers':[x['workers']for x in sample['dependencies']['consumers']],'images':image_proofs,'immutableServicesPreserved':4,'modelsInvokedByReceiver':0,**({'codex':runtime_health}if runtime_health else{})}
 def deploy(h,stream):
- global run_dir,phase,rolling_back
+ global run_dir,phase,rolling_back,maintenance_started
  require_host_ready()
  require(not(STATE/'codex-configuration.pending.json').exists(),'CODEX_CONFIGURATION_RECOVERY_REQUIRED')
  observed=release_status(h)
@@ -917,20 +1030,21 @@ def deploy(h,stream):
   handler,context=initial_handler();return handler.deploy(context,h,stream)
  require('initialGateId'not in h,'INITIAL_GATE_ON_ACTIVE_RUNTIME_REFUSED')
  value,before=current();version_policy(h,value)
+ timing_start();release_phase('release-preflight')
  staging=OPS/'incoming';staging.mkdir(mode=0o700,exist_ok=True);run_dir=staging/(h['sourceSha']+'-'+uuid.uuid4().hex[:12]);run_dir.mkdir(mode=0o700)
  require_release_disk(h['bundleBytes'])
  handler,context=registry_handler();registry=handler.ticket(context,h)
  if registry:
-  phase='registry-pull';m,web,web_info,image_proofs=handler.pull(context,h,stream,registry)
+  release_phase('registry-pull');m,web,web_info,image_proofs=handler.pull(context,h,stream,registry)
  else:
-  phase='receive';bundle=run_dir/'bundle.tar'
+  release_phase('receive');bundle=run_dir/'bundle.tar'
   if'transferTicket'in h:
-   start_liveness(stream);phase='relay-download';relay_download(h,bundle)
+   start_liveness(stream);release_phase('relay-download');relay_download(h,bundle)
   else:
    receive(stream,bundle,h['bundleBytes'],h['bundleSha256'],require_eof=False);start_liveness(stream)
   unpack_bundle(bundle,run_dir);m=manifest(run_dir/'manifest.json',h)
-  phase='validate-artifacts';web=run_dir/'web-dist';web_info=web_unpack(run_dir/'web.tar.gz',web,h);expanded,archive_configs=images_unpack(run_dir/'images.tar.zst',m,h)
-  phase='load-images';existing_policies={}
+  release_phase('validate-artifacts');web=run_dir/'web-dist';web_info=web_unpack(run_dir/'web.tar.gz',web,h);expanded,archive_configs=images_unpack(run_dir/'images.tar.zst',m,h)
+  release_phase('load-images');existing_policies={}
   for item in m['images'].values():
    existing=subprocess.run(DOCKER+['image','inspect',item['tag']],capture_output=True,timeout=30,env=ops.fixed_env())
    if existing.returncode==0:existing_policies[item['tag']]=existing_image_policy(decode(existing.stdout)[0],archive_configs[item['tag']],item,h,before)
@@ -947,17 +1061,20 @@ def deploy(h,stream):
   shutil.rmtree(web)
  else:
   target.mkdir(mode=0o700);shutil.move(str(web),target/'web-dist');atomic(target/'manifest.json',(run_dir/'manifest.json').read_bytes())
- phase='candidate-preflight';candidate=candidate_preflight(h,m,target/'web-dist')
- phase='api-shutdown-acceptance';shutdown_proof=api_shutdown_acceptance(h,m,image_proofs,before)
+ release_phase('candidate-preflight');candidate=candidate_preflight(h,m,target/'web-dist')
+ release_phase('api-shutdown-acceptance');shutdown_proof=api_shutdown_acceptance(h,m,image_proofs,before)
  previous=OVERRIDE.read_bytes()if OVERRIDE.exists()else None
  atomic(run_dir/'rollback-metadata.json',{'previousOverridePresent':previous is not None,'previousSourceSha':value['buildSha'],'snapshotId':snapshot_id})
  if previous is not None:atomic(run_dir/'previous-compose.release.yaml',previous)
  stopped=False;switched=False;migration_started=False;migration_ok=False
- with ops.maintenance('ci-release-'+h['sourceSha'][:12],minutes=45):
+ with admission_scope(h) as admission, ops.maintenance('ci-release-'+h['sourceSha'][:12],minutes=45):
+  maintenance_started=time.perf_counter()
   operation=release_operation_create(h,value,before)
   forced=None;forced_requested=False;force_intent=False
   try:
-   phase='drain'
+   if admission is not None:
+    release_phase('gate-critical');admission_request(admission,'enter_critical',requireStorageWriteBarrier=False)
+   release_phase('drain')
    force_path=STATE/'api-force-stop-once.json';force_intent=force_path.exists()or force_path.is_symlink()
    forced=claim_force_resume(h,value,before['api'],registry)
    if forced is not None:drain(before['worker-general'])
@@ -972,21 +1089,26 @@ def deploy(h,stream):
     if forced is not None:forced_requested=True
    stop_api_guarded(before['api'],mark_stopped,forced['expiresAt'] if forced else None,verify_forced_queue,mark_request)
    operation=release_operation_phase(operation,'api_stopped')
+   release_phase('worker-drain')
    drain(before['worker-general'])
-   phase='worker-stop'
+   release_phase('worker-stop')
    operation=release_operation_phase(operation,'worker_stop_requested')
    stop_workers_for_release(before['worker-general'],before['worker-ppt'])
    operation=release_operation_phase(operation,'workers_stopped')
-   phase='migration';operation=release_operation_phase(operation,'migration_started');migration_started=True;migration(h,m);migration_ok=True
-   phase='activate';operation=release_operation_phase(operation,'activation_started');switched=True;atomic(OVERRIDE,candidate);ops.preflight();up_four()
-   phase='verify';operation=release_operation_phase(operation,'verification_started');verification=postflight(h,m,before,image_proofs)
+   release_phase('migration');operation=release_operation_phase(operation,'migration_started');migration_started=True
+   if admission is not None:admission['migrationStarted']=True
+   migration(h,m);migration_ok=True
+   release_phase('activate');operation=release_operation_phase(operation,'activation_started');switched=True;atomic(OVERRIDE,candidate);ops.preflight();up_four()
+   release_phase('verify');operation=release_operation_phase(operation,'verification_started');verification=postflight(h,m,before,image_proofs)
    verification['apiShutdownAcceptance']=shutdown_proof
+   admission_release(admission)
    finish_liveness()
    result={'status':'deployed','version':h['version'],'sourceSha':h['sourceSha'],'bundleBytes':h['bundleBytes'],'bundleSha256':h['bundleSha256'],'snapshotId':snapshot_id,'backupPolicy':'mac-direct-daily-no-pre-release-backup','verification':verification,'deployedAt':utc(),'sourceRepository':SOURCE,'apiShutdown':{'mode':'forced','approval':'claimed','requestAttempted':forced_requested,'stopConfirmed':stopped,'outcome':'confirmed','exitCode':137,'approvalId':forced['nonce']} if forced else {'mode':'graceful','exitCode':0}}
+   attach_timings(result)
    atomic(STATE/'last-success.json',result);atomic(target/'deployment-receipt.json',result);release_operation_clear(operation)
   except Exception as error:
    rolling_back=True
-   phase_before_rollback=phase;rollback_ok=True;rollback_cause=None
+   phase_before_rollback=phase;release_phase('rollback');rollback_ok=True;rollback_cause=None
    try:
     if phase_before_rollback in('worker-stop','migration','activate')or isinstance(error,Refused)and str(error)in('API_DRAIN_STOP_UNCERTAIN','API_DRAIN_CLEANUP_FAILED','API_DRAIN_RECOVERY_REQUIRED'):
      raise Refused('API_DRAIN_MANUAL_RECOVERY_REQUIRED')
@@ -1006,10 +1128,12 @@ def deploy(h,stream):
      'requestAttempted':forced_requested,'stopConfirmed':stopped,
      'outcome':'confirmed' if stopped else 'unknown' if forced_requested else 'not_requested',
      **({'approvalId':forced['nonce']} if forced else {})}
+   attach_timings(result)
    record_failed_operation(operation,result,target,run_dir);return result
  return result
 def stage(h,stream):
  global run_dir,phase
+ timing_start();release_phase('release-preflight')
  require_host_ready()
  require(not(STATE/'codex-configuration.pending.json').exists(),'CODEX_CONFIGURATION_RECOVERY_REQUIRED')
  require('transferTicket'in h,'STAGE_RELAY_REQUIRED')
@@ -1022,11 +1146,11 @@ def stage(h,stream):
  require_release_disk(h['bundleBytes'])
  handler,context=registry_handler();registry=handler.ticket(context,h)
  if registry:
-  phase='stage-registry-pull';m,web,web_info,proofs=handler.pull(context,h,stream,registry)
+  release_phase('stage-registry-pull');m,web,web_info,proofs=handler.pull(context,h,stream,registry)
  else:
-  phase='stage-relay-download';start_liveness(stream);bundle=run_dir/'bundle.tar';relay_download(h,bundle)
-  phase='stage-validate';unpack_bundle(bundle,run_dir);m=manifest(run_dir/'manifest.json',h);web=run_dir/'web-dist';web_info=web_unpack(run_dir/'web.tar.gz',web,h);expanded,configs=images_unpack(run_dir/'images.tar.zst',m,h)
-  phase='stage-load-images'
+  release_phase('stage-relay-download');start_liveness(stream);bundle=run_dir/'bundle.tar';relay_download(h,bundle)
+  release_phase('stage-validate');unpack_bundle(bundle,run_dir);m=manifest(run_dir/'manifest.json',h);web=run_dir/'web-dist';web_info=web_unpack(run_dir/'web.tar.gz',web,h);expanded,configs=images_unpack(run_dir/'images.tar.zst',m,h)
+  release_phase('stage-load-images')
   for item in m['images'].values():
    existing=subprocess.run(DOCKER+['image','inspect',item['tag']],capture_output=True,timeout=30,env=ops.fixed_env())
    if existing.returncode==0:existing_image_policy(decode(existing.stdout)[0],configs[item['tag']],item,h,before)
@@ -1039,6 +1163,7 @@ def stage(h,stream):
   target.mkdir(mode=0o700);shutil.move(str(web),target/'web-dist');atomic(target/'manifest.json',(run_dir/'manifest.json').read_bytes())
  result={'status':'staged','sourceSha':h['sourceSha'],'version':h['version'],'transferTicket':h['transferTicket'],'bundleBytes':h['bundleBytes'],'bundleSha256':h['bundleSha256']}
  if(run_dir/'registry-timings.json').exists():result['timings']=decode((run_dir/'registry-timings.json').read_bytes())
+ attach_timings(result)
  atomic(target/'stage-receipt.json',{**result,'images':proofs,'web':web_info,'stagedAt':utc(),'appDeployments':0,'databaseMigrations':0,'servicesModified':0});finish_liveness();return result
 def diagnostics(h,stream):
  destination=OPS/'diagnostics'/h['sourceSha'];destination.mkdir(mode=0o700,parents=True,exist_ok=True)
@@ -1056,6 +1181,7 @@ def main():
   signal.alarm(45);h=header(stream);initialize(h['action']);signal.alarm(10800 if h['action']in('deploy','stage')else 1830 if h['action']=='resume-transfer'else 180 if h['action']=='prepare-transfer'else 120 if h['action']=='diagnostics'else 45)
   if h['action']=='diagnostics':return diagnostics(h,stream)
   if h['action']=='verify':require(stream.read(1)==b'','PAYLOAD_UNEXPECTED');return verify(h)
+  if h['action']=='capacity':require(stream.read(1)==b'','PAYLOAD_UNEXPECTED');return dict(capacity_report(),status='capacity')
   if h['action']=='build-preflight':
    require(stream.read(1)==b'','PAYLOAD_UNEXPECTED')
    with release_lock():return build_preflight(h)

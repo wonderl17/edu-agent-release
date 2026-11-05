@@ -418,7 +418,7 @@ def main():
         started=True
         app.command(app.argv()+['up','-d','--no-build','--pull','never','--wait','--wait-timeout','90','postgres','redis','client','upstream'],timeout=120)
         require(app.db("const r=await p.$queryRawUnsafe(\"SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema='public'\");console.log(r[0].n);")==0,'FRESH_DATABASE_REQUIRED')
-        app.node("require('child_process').execFileSync('pnpm',['exec','prisma','db','push','--skip-generate'],{stdio:'inherit'})",timeout=120)
+        app.node("require('child_process').execFileSync(process.execPath,['/app/node_modules/prisma/build/index.js','db','push','--skip-generate'],{stdio:'inherit'})",timeout=120)
         classroom=app.db("await p.user.create({data:{id:'teacher',email:'teacher@example.invalid',role:'ADMIN'}});const c=await p.classroom.create({data:{userId:'teacher',name:'synthetic shutdown class',subject:'数学'}});console.log(JSON.stringify(c.id));")
         version=json.loads(app.node("console.log(JSON.stringify(require('/app/package.json').version))"))
         require(version==args.version,'API_PACKAGE_VERSION_MISMATCH')

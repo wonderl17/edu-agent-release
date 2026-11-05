@@ -147,7 +147,7 @@ console.log(JSON.stringify({status:db.status,error:db.errorMessage,result:db.res
         try:
             app.command(app.compose_argv()+['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '60', 'postgres', 'redis', 'web', 'model'], timeout=90)
             require(app.db("const r=await p.$queryRawUnsafe(\"SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema='public'\");console.log(r[0].n)", 'web') == 0, 'FRESH_DATABASE_REQUIRED')
-            app.node("require('child_process').execFileSync('pnpm',['exec','prisma','migrate','deploy'],{stdio:'inherit'})", 'web', timeout=120)
+            app.node("require('child_process').execFileSync(process.execPath,['/app/node_modules/prisma/build/index.js','migrate','deploy'],{stdio:'inherit'})", 'web', timeout=120)
             app.db("await p.user.create({data:{id:'teacher',email:'synthetic-text@example.invalid'}});await p.student.create({data:{id:'student',userId:'teacher',name:'合成学生'}});console.log('true')", 'web')
             for kind in ('classroom', 'phone'):
                 model('/next'); current = initial = seed(kind); start()

@@ -95,7 +95,7 @@ def main():
                 'postgres','redis','web','worker-general','worker-ppt','storage','gateway','planner','codex-agent-runtime'],timeout=90)
             count=app.db("const r=await p.$queryRawUnsafe(\"SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema='public'\");console.log(r[0].n);",'web')
             require(count==0,'FRESH_DATABASE_REQUIRED')
-            app.node("require('child_process').execFileSync('pnpm',['exec','prisma','db','push','--skip-generate'],{stdio:'inherit'})",'web',timeout=120)
+            app.node("require('child_process').execFileSync(process.execPath,['/app/node_modules/prisma/build/index.js','db','push','--skip-generate'],{stdio:'inherit'})",'web',timeout=120)
             classroom=app.db("await p.user.create({data:{id:'teacher',email:'teacher@example.invalid',role:'ADMIN'}});const c=await p.classroom.create({data:{userId:'teacher',name:'synthetic shutdown class',subject:'数学'}});console.log(JSON.stringify(c.id));",'web')
             app.command(app.compose_argv()+['up','-d','--no-build','--pull','never','--wait','--wait-timeout','120','api'],timeout=150)
             for failure in (False,True):

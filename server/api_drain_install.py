@@ -26,7 +26,12 @@ FILES = {
     'operations/release/api_drain.py': 'api_drain.py',
     'operations/release/codex_configure.py': 'codex_configure.py',
     'operations/release/api_image_shutdown.py': 'api_image_shutdown.py',
+    'operations/release/release_capacity.py': 'release_capacity.py',
+    'operations/release/maintenance_gate.py': 'maintenance_gate.py',
+    'operations/release/image_retention.py': 'image_retention.py',
 }
+OPTIONAL_FILES = frozenset('operations/release/' + name for name in
+    ('api_drain.py','api_image_shutdown.py','release_capacity.py','maintenance_gate.py','image_retention.py'))
 PENDING = 'operations/release/state/api-drain-install.pending.json'
 ROLLBACK_READY = 'operations/release/state/api-drain-install.rollback-ready.json'
 BLOCKERS = (
@@ -34,6 +39,8 @@ BLOCKERS = (
     'operations/release/state/codex-configuration.pending.json',
     'operations/release/state/api-drain.pending.json',
     'operations/release/state/release-operation.pending.json',
+    'operations/release/state/release-admission.pending.json',
+    'operations/release/state/maintenance-gate.pending.json',
 )
 OPS = 'operations/startup/production-ops.py'
 GATE = (b'#!/usr/bin/python3\nimport json,sys\n'
@@ -126,7 +133,7 @@ class Installer:
         require(digest(raw) == self.bundle.name, 'DRAIN_INSTALL_MANIFEST_HASH')
         value = decode(raw)
         require(isinstance(value, dict) and set(value) == {'schemaVersion', 'scope', 'root', 'installerSha256', 'files', 'dependencies'} and
-                value['schemaVersion'] == 1 and value['scope'] == SCOPE and value['root'] == str(ROOT) and
+                type(value['schemaVersion']) is int and value['schemaVersion'] == 1 and value['scope'] == SCOPE and value['root'] == str(ROOT) and
                 set(value['files']) == set(FILES) and isinstance(value['dependencies'], dict) and
                 set(value['dependencies']) == {OPS} and
                 re.fullmatch('[0-9a-f]{64}', value['dependencies'][OPS]), 'DRAIN_INSTALL_MANIFEST')
@@ -137,7 +144,8 @@ class Installer:
             row = value['files'][name]
             require(isinstance(row, dict) and set(row) == {'beforeSha256', 'afterSha256', 'payload'} and
                     row['payload'] == 'files/' + filename and
-                    (row['beforeSha256'] is None or re.fullmatch('[0-9a-f]{64}', row['beforeSha256'])) and
+                    ((row['beforeSha256'] is None and name in OPTIONAL_FILES) or
+                     isinstance(row['beforeSha256'],str) and re.fullmatch('[0-9a-f]{64}', row['beforeSha256'])) and
                     re.fullmatch('[0-9a-f]{64}', row['afterSha256']), 'DRAIN_INSTALL_FILE_CONTRACT')
             if name == RECEIVER:
                 require(row['beforeSha256'] is not None, 'DRAIN_INSTALL_FILE_CONTRACT')
@@ -185,8 +193,7 @@ class Installer:
                                for name, item in containers.items()}}
 
     def control_command(self, args, runtime):
-        sensitive = (RECEIVER, 'operations/release/codex_configure.py',
-                     'operations/release/api_image_shutdown.py', OPS)
+        sensitive = (*FILES, OPS)
         if any(str(self.root / name) in value for name in sensitive for value in args): return True
         if not any(Path(value).name in ('docker', 'docker-compose') for value in args[:2]): return False
         containers = runtime['containers']

@@ -60,7 +60,66 @@ Install the receiver and API-drain helper together under the existing checksum/c
 
 The matched host bundle also installs `api_image_shutdown.py`. Before normal `deploy`/`resume` enters maintenance or stops any Production container, the receiver automatically accepts the final API image in a disposable stack with empty PostgreSQL/Redis stores and deterministic local upstreams. The original API entrypoint handles concurrent SSE, voice WebSocket, ordinary HTTP and coordinator work; the actual drain helper must prove a clean bounded stop, and a database outage must still produce a nonzero exit with durable restart recovery. This does not call a provider or use Production credentials, data, volumes or queue consumers. The verifier limits its own resources and must remove its containers, network, volumes, firewall rules and systemd units before a proof can pass. User cancellation interrupts acceptance and allows bounded isolated cleanup; failure leaves the original release running.
 
-Root-only successful proofs bind the source/version, immutable API digest and actual Docker image ID, installed verifier/helper hashes, kernel and dependency image IDs. An identical original-package retry reuses its valid proof; changed code, helper or environment reruns acceptance automatically. Signal-only and synthetic-entrypoint results cannot satisfy the gate. The successful release receipt records the proof hash and implementation identities. `stage` retains its artifact-only contract; the same verifier may be run separately after staging to inspect the candidate without entering Production maintenance. Install all four files together; adding the controller gate without its verifier is incomplete.
+Root-only successful proofs bind the source/version, immutable API digest and actual Docker image ID, installed verifier/helper hashes, kernel and dependency image IDs. An identical original-package retry reuses its valid proof; changed code, helper or environment reruns acceptance automatically. Signal-only and synthetic-entrypoint results cannot satisfy the gate. The successful release receipt records the proof hash and implementation identities. `stage` retains its artifact-only contract; the same verifier may be run separately after staging to inspect the candidate without entering Production maintenance. Install the complete matched helper bundle; adding the controller gate without its dependencies is incomplete.
+
+### Matched host helper update
+
+The hash-bound installer now installs seven files: `receiver.py`, `api_drain.py`, `codex_configure.py`, `api_image_shutdown.py`, `release_capacity.py`, `maintenance_gate.py`, and `image_retention.py`. Newly introduced helpers may be absent in the read-only audit; existing file hashes, the fixed Production root, startup policy hash and service/container/image/start identities must match. It obtains the existing release and maintenance locks, refuses pending release/admission/gate/install state, fences the old receiver, installs dependencies first and exposes the new receiver last. It does not restart services, run migrations, build products, activate admission, delete images or change storage. A crash preserves a same-bundle recovery journal, including bytes and absence of previously missing files.
+
+Run the tests, review these sources, then freeze their SHA-256 values. Use a canonical absolute local directory owned by the operator with mode `0700`; its audit, review and transport records remain private. The existing fixed SSH identity and known-host file are also used by the sender. The following audit is read-only:
+
+```sh
+TASK_RELEASE_REVIEW_DIR=/absolute/private/review-directory
+mkdir -m 700 "$TASK_RELEASE_REVIEW_DIR"
+umask 077
+ssh -F /dev/null -T -i /Users/wonderl/.ssh/teaching-ai-tencent-validation \
+  -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=/Users/wonderl/Backups/tencent-production-cutover-20261024/pipeline/server-known-hosts \
+  ubuntu@49.233.166.202 sudo -n /usr/bin/python3 - \
+  < server/api_drain_install_audit.py > "$TASK_RELEASE_REVIEW_DIR/host-audit.json"
+```
+
+After review, write the frozen source map (`installer` and the seven payload filenames) and a separately reviewed transport receiver hash. The builder rejects any source change after this step:
+
+```sh
+python3 - "$TASK_RELEASE_REVIEW_DIR" <<'PY'
+import hashlib, importlib.util, json, os, pathlib, sys
+directory = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location('reviewed_builder', 'scripts/build_api_drain_install_bundle.py')
+builder = importlib.util.module_from_spec(spec); spec.loader.exec_module(builder)
+values = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in builder.SOURCES.items()}
+for name, value in [('reviewed-source-sha256.json', values), ('reviewed-transport.json', {
+    'receiverSha256': hashlib.sha256(pathlib.Path('server/api_drain_bundle_receive.py').read_bytes()).hexdigest()})]:
+    path = directory / name
+    with path.open('x') as output: json.dump(value, output, sort_keys=True); output.write('\n')
+    path.chmod(0o600)
+(directory / 'bundles').mkdir(mode=0o700)
+PY
+python3 scripts/build_api_drain_install_bundle.py \
+  --audit "$TASK_RELEASE_REVIEW_DIR/host-audit.json" \
+  --reviewed "$TASK_RELEASE_REVIEW_DIR/reviewed-source-sha256.json" \
+  --output "$TASK_RELEASE_REVIEW_DIR/bundles"
+```
+
+Use exactly the 64-hex `manifestSha256` returned by the builder and the frozen `receiverSha256`; do not regenerate pins to make a changed source pass:
+
+```sh
+TASK_BUNDLE_ID=<manifestSha256>
+TASK_TRANSPORT_SHA256=<reviewed-receiverSha256>
+python3 scripts/send_api_drain_install_bundle.py \
+  --bundle "$TASK_RELEASE_REVIEW_DIR/bundles/$TASK_BUNDLE_ID" \
+  --receiver-sha256 "$TASK_TRANSPORT_SHA256"
+for TASK_INSTALL_ACTION in check apply; do
+  ssh -F /dev/null -T -i /Users/wonderl/.ssh/teaching-ai-tencent-validation \
+    -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+    -o UserKnownHostsFile=/Users/wonderl/Backups/tencent-production-cutover-20261024/pipeline/server-known-hosts \
+    ubuntu@49.233.166.202 sudo -n /usr/bin/python3 \
+    "/opt/teaching-ai-production/operations/release/drain-update-bundles/$TASK_BUNDLE_ID/install.py" \
+    "$TASK_INSTALL_ACTION" || break
+done
+```
+
+An uncertain send is inspected without retrying the install. An interrupted install uses the same bundle's `install.py recover`, which restores an uncommitted update or finishes a durably committed one; it refuses external changes and other pending operations. Admission owner recovery is separate: root passes the existing private owner context to `maintenance_gate.py` through stdin. `recover_pending` reconciles authoritative PG ownership; it never clears an owned gate because a lease is old. A successful helper installation is not product deployment or evidence that the new admission capability is active.
 
 Verified legacy archives use their immutable image ID for the same acceptance; mutable legacy tags cannot select the executed image. A historical API without the lifecycle contract or required application routes cannot pass normal automatic acceptance. Restoring such a version requires the separately reviewed Legacy/rollback procedure; the ordinary path does not bypass acceptance or automatically force-stop it.
 
@@ -71,6 +130,8 @@ The `teaching-validation` stack is stopped and retained. Its workflow has no sch
 ## Per-release CNB CPU usage
 
 New Cloud builds perform a read-only `build-preflight` on the target before recording an attempt, creating deployment metadata or starting CNB/COS builds. The receiver applies the same disk reserve as deployment (32 GiB images, 512 MiB extracted Web and 2 GiB headroom), plus the transfer size bound: 12000 bytes for a CNB registry manifest or 5 GiB for a legacy COS bundle. Insufficient space or an older receiver without this action stops the build; install the matching receiver before updating the controller. Deployment/staging still rechecks actual free space with the actual package size, since capacity can change during a build. Original-package resume keeps its existing deployment-time check and does not rebuild. Health-only verify and scheduled no-op checks remain independent of build capacity.
+
+The matched receiver's read-only `capacity` action and build preflight share `release_capacity.py`: both the operations directory and Docker's actual data-root filesystem are checked, and a shared filesystem is counted once using its conservative observation. Less than 60 GiB available warns, less than 45 GiB is critical, and insufficient release reserve or fewer than 10000 available inodes on a filesystem that reports inode counts refuses a new release. Responses contain fixed roles and numeric capacity, never filesystem paths or credentials.
 
 Host image cleanup must preserve all container references, current and rollback images, and staged/failed packages still retained for recovery. Delete only an explicitly reviewed obsolete image set after rechecking release state under the control locks; never use an unrestricted prune, delete private registry artifacts, volumes, release manifests or receipts, or treat build cache as recovery material.
 
@@ -83,7 +144,7 @@ The private CNB build title includes the public GitHub run ID and attempt, so th
 - A dedicated GitHub App is installed only on the two private source repositories. Read tokens fetch source; write tokens are issued only for private GitHub Release operations and expire automatically.
 - Only the public controller is checked out by an Actions checkout step. Private source is fetched into a temporary directory and verified against its origin and trusted main history.
 - Private stdout/stderr, exception messages and GitHub file commands never enter public logs, including failed commands. Public logs show fixed phases and status codes. Private temporary logs and source are removed after each run. Diagnose current Cloud failures in the target’s root-only release receipts/logs; public logs intentionally contain no build details.
-- Desktop subprocess checkpoints add only fixed stage IDs, `start`/`success`/`failure` states, fixed platform labels and bounded elapsed milliseconds after private execution. The trusted controller validates the latest 256 records from a 16 KiB private temporary channel, then removes it. Nested and parallel timings overlap; the Actions job duration is the total. Arguments, paths, environment values, child output and exception text are never included; diagnostic I/O failures do not change the release result. Product source and package metadata are unchanged.
+- Desktop subprocess checkpoints add only fixed stage IDs, `start`/`success`/`failure` states, fixed platform labels and bounded elapsed milliseconds after private execution. R2 staging, COS publication, private GitHub upload and public installer mirroring have separate timings. The cache CLI's exact finite result grammar is reconstructed as fixed mode/status/reason fields; a quick restore is never treated as proof of a hit. The trusted controller validates the latest 256 records from a 16 KiB private temporary channel, then removes it. Nested and parallel timings overlap; the Actions job duration is the total. Arguments, paths, environment values, arbitrary child output and exception text are never included; diagnostic I/O failures do not change the release result.
 - No Actions artifacts or Actions caches are uploaded. The private desktop entrypoint can reuse an authenticated, encrypted dependency-only R2 cache; private source, signing state and product outputs are excluded. Missing or invalid caches do not block the build. Existing COS, R2 and private GitHub Release uploads continue. Only `ShukeZhinao-<version>-mac-arm64.pkg`, `-mac-x64.pkg` and `-win-x64.exe` are copied from the selected private Release to this repository’s public Release; size and SHA-256 must match before and after upload. A fresh build first copies matching local installer bytes and downloads only missing/mismatched installers; `resume` continues to download the original private Release assets. Source archives, logs, source maps, update packages and private release notes are excluded. Identical assets are reused; different bytes under the same name are rejected. Public tags target the controller commit, never the private source commit. The public write token stays outside private execution. A failed private publication remains failed even if its saved installers can be copied; cancellation stops the copy.
 - Current Cloud workflows do not authenticate to GCP. Retired GCP resources and backups remain recovery material; restarting them requires explicit rollback authorization.
 - The existing `production-release` environment is restricted to `main`; each workflow explicitly passes only its own credentials. No PR-triggered privileged workflow exists. Official setup actions are pinned to immutable commits.

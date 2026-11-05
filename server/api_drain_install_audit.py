@@ -9,12 +9,17 @@ import sys
 
 ROOT = Path('/opt/teaching-ai-production')
 TARGETS = ('operations/release/receiver.py', 'operations/release/api_drain.py',
-           'operations/release/codex_configure.py', 'operations/release/api_image_shutdown.py')
+           'operations/release/codex_configure.py', 'operations/release/api_image_shutdown.py',
+           'operations/release/release_capacity.py','operations/release/maintenance_gate.py','operations/release/image_retention.py')
+OPTIONAL_FILES = frozenset('operations/release/' + name for name in
+    ('api_drain.py','api_image_shutdown.py','release_capacity.py','maintenance_gate.py','image_retention.py'))
 DEPENDENCIES = ('operations/startup/production-ops.py',)
 BLOCKERS = ('operations/release/state/codex-host-install.pending.json',
             'operations/release/state/codex-configuration.pending.json',
             'operations/release/state/api-drain.pending.json',
             'operations/release/state/release-operation.pending.json',
+            'operations/release/state/release-admission.pending.json',
+            'operations/release/state/maintenance-gate.pending.json',
             'operations/release/state/api-drain-install.pending.json',
             'operations/release/state/api-drain-install.rollback-ready.json')
 
@@ -43,7 +48,7 @@ def private_hash(name, missing=False):
 def main():
     if os.geteuid() != 0 or len(sys.argv) != 1 or ROOT.resolve() != ROOT:
         raise ValueError('DRAIN_AUDIT_SCOPE_REFUSED')
-    targets = {name: private_hash(name, missing=name.endswith(('/api_drain.py', '/api_image_shutdown.py'))) for name in TARGETS}
+    targets = {name: private_hash(name, missing=name in OPTIONAL_FILES) for name in TARGETS}
     deps = {name: private_hash(name) for name in DEPENDENCIES}
     blockers = {name: (ROOT / name).exists() or (ROOT / name).is_symlink() for name in BLOCKERS}
     print(json.dumps({'schemaVersion': 1, 'scope': 'teaching-production-api-drain-audit-v1',

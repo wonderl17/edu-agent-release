@@ -121,8 +121,8 @@ def main():
             return json.loads(node("fetch('http://model:4988"+path+"').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))"))
         def migrate(image,label):
             # A dedicated Compose service reuses only this fresh database's env.
-            migration=copy.deepcopy(base['services']['control']);migration.update(image=image,entrypoint=['/usr/local/bin/pnpm'],
-                command=['exec','prisma','migrate','deploy','--schema','/app/prisma/schema.prisma'])
+            migration=copy.deepcopy(base['services']['control']);migration.update(image=image,entrypoint=['/usr/local/bin/node'],
+                command=['/app/node_modules/prisma/build/index.js','migrate','deploy','--schema','/app/prisma/schema.prisma'])
             value=json.loads(app.base_path.read_bytes());value['services']['migration']=migration;app.atomic(app.base_path,value)
             output=app.command(app.compose_argv()+['run','--rm','--no-deps','-T','migration'],timeout=300)
             (root/(label+'.log')).write_bytes(output)

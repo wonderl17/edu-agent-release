@@ -24,16 +24,18 @@ class ReleaseDiskTests(unittest.TestCase):
         for backend, bundle_limit in [('cnb', 12000), ('cos', r.MAX_RELAY)]:
             required = r.MAX_IMAGES + bundle_limit + r.MAX_WEB + 2 * 1024**3
             with self.subTest(backend=backend):
-                with patch.object(r.shutil, 'disk_usage', return_value=SimpleNamespace(free=required-1)), \
+                with patch.object(r, 'capacity_report', return_value=dict(releaseReady=False,availableBytes=required-1,requiredBytes=required)), \
                      self.assertRaisesRegex(r.Refused, '^INSUFFICIENT_RELEASE_DISK$'):
                     r.build_preflight({'backend': backend})
-                with patch.object(r.shutil, 'disk_usage', return_value=SimpleNamespace(free=required)):
+                capacity=dict(releaseReady=True,availableBytes=required,requiredBytes=required)
+                with patch.object(r, 'capacity_report', return_value=capacity) as check:
                     result = r.build_preflight({'backend': backend})
-                    self.assertEqual(result, dict(status='build_ready', availableBytes=required, requiredBytes=required))
+                    self.assertEqual(result, dict(status='build_ready', availableBytes=required, requiredBytes=required,capacity=capacity))
+                    check.assert_called_once_with(bundle_limit)
                     self.assertEqual(r.require_release_disk(bundle_limit), result)
                     self.assertEqual(r.phase, 'build-preflight')
                 # A successful earlier check cannot bypass the deployment guard.
-                with patch.object(r.shutil, 'disk_usage', return_value=SimpleNamespace(free=0)), \
+                with patch.object(r, 'capacity_report', return_value=dict(releaseReady=False,availableBytes=0,requiredBytes=required)), \
                      self.assertRaisesRegex(r.Refused, '^INSUFFICIENT_RELEASE_DISK$'):
                     r.require_release_disk(bundle_limit)
 

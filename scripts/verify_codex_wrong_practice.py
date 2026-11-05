@@ -161,7 +161,7 @@ console.log(JSON.stringify({status:db.status,error:db.errorMessage,result:db.res
         try:
             app.command(app.compose_argv()+['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '60', 'postgres', 'redis', 'web', 'model'], timeout=90)
             require(app.db("const r=await p.$queryRawUnsafe(\"SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema='public'\");console.log(r[0].n)", 'web') == 0, 'FRESH_DATABASE_REQUIRED')
-            app.node("require('child_process').execFileSync('pnpm',['exec','prisma','migrate','deploy'],{stdio:'inherit'})", 'web', timeout=120)
+            app.node("require('child_process').execFileSync(process.execPath,['/app/node_modules/prisma/build/index.js','migrate','deploy'],{stdio:'inherit'})", 'web', timeout=120)
             identities = app.db("const user=await p.user.create({data:{email:'synthetic-practice@example.invalid'}});const student=await p.student.create({data:{userId:user.id,name:'合成学生'}});console.log(JSON.stringify({userId:user.id,studentId:student.id}))", 'web')
             model('/next'); current = initial = seed(); start()
             first = wait(lambda: partial(initial), 'INITIAL_PRACTICE_NOT_PENDING')

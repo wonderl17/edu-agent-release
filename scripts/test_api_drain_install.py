@@ -28,7 +28,7 @@ class Fixture:
         self.before = {}
         self.after = {}
         for name in m.FILES:
-            data = None if name.endswith(('/api_drain.py', '/api_image_shutdown.py')) else ('# old ' + name + '\n').encode()
+            data = None if name in m.OPTIONAL_FILES else ('# old ' + name + '\n').encode()
             self.before[name] = data
             self.after[name] = ('# reviewed ' + name + '\n').encode()
             if data is not None:
@@ -72,6 +72,25 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self.f.installer.apply()['status'], 'installed')
         self.assertEqual({name: self.f.read(name) for name in m.FILES}, self.f.after)
         self.assertIsNone(self.f.read(m.PENDING))
+
+    def test_new_dependencies_are_installed_before_new_receiver_is_exposed(self):
+        events=[]
+        self.f.installer.fault=lambda name,data:events.append((name,data))
+        self.f.installer.apply()
+        final=events.index((m.RECEIVER,self.f.after[m.RECEIVER]))
+        self.assertLess(events.index((m.RECEIVER,m.GATE)),final)
+        for name in ('release_capacity.py','maintenance_gate.py','image_retention.py'):
+            target='operations/release/'+name
+            self.assertIsNone(self.f.before[target])
+            self.assertLess(events.index((target,self.f.after[target])),final)
+
+    def test_admission_and_shared_gate_pending_state_block_install_without_writes(self):
+        for name in ('release-admission.pending.json','maintenance-gate.pending.json'):
+            path=self.f.root/'operations/release/state'/name
+            path.write_bytes(b'{}');path.chmod(0o600)
+            with self.assertRaisesRegex(ValueError,'DRAIN_INSTALL_CONTROL_PENDING'):self.f.installer.apply()
+            self.assertEqual({name:self.f.read(name)for name in m.FILES},self.f.before)
+            self.assertIsNone(self.f.read(m.PENDING));path.unlink()
 
     def test_wrong_before_hash_and_pending_operation_refuse_before_writes(self):
         (self.f.root / m.RECEIVER).write_bytes(b'# unexpected\n')
@@ -304,6 +323,10 @@ inst.apply()
         message = json.loads(raw); message['files']['files/api_drain.py'] = base64.b64encode(b'changed').decode()
         with self.assertRaisesRegex(ValueError, 'DRAIN_RECEIVE_MANIFEST_REFUSED'):
             endpoint.receive(json.dumps(message).encode(), bundle.name)
+        for helper in ('release_capacity.py','maintenance_gate.py','image_retention.py'):
+            message=json.loads(raw);del message['files']['files/'+helper]
+            with self.assertRaisesRegex(ValueError,'DRAIN_RECEIVE_MEMBERS_REFUSED'):
+                endpoint.receive(json.dumps(message).encode(),bundle.name)
         self.assertEqual(endpoint.receive(raw, bundle.name)['status'], 'received')
         self.assertEqual(endpoint.receive(raw, bundle.name)['status'], 'present')
         for name in receiver.MEMBERS:
@@ -341,6 +364,21 @@ inst.apply()
             with self.assertRaisesRegex(ValueError, 'DRAIN_SEND_RECEIVER_CHANGED'):
                 sender.send(self.f.root / ('a' * 64), '0' * 64)
         call.assert_not_called()
+
+    def test_audit_receiver_builder_and_installer_share_exact_fixed_scope(self):
+        root=SOURCE.parent.parent
+        modules={}
+        for name,file in (('audit','server/api_drain_install_audit.py'),('receive','server/api_drain_bundle_receive.py'),
+                          ('builder','scripts/build_api_drain_install_bundle.py')):
+            spec=importlib.util.spec_from_file_location('matched_'+name,root/file)
+            value=importlib.util.module_from_spec(spec);spec.loader.exec_module(value);modules[name]=value
+        self.assertEqual(set(modules['audit'].TARGETS),set(m.FILES))
+        self.assertEqual(modules['receive'].FILES,m.FILES)
+        self.assertEqual(set(modules['builder'].SOURCES),{'installer'}|set(m.FILES.values()))
+        self.assertEqual(modules['receive'].OPTIONAL_FILES,m.OPTIONAL_FILES)
+        self.assertEqual(modules['audit'].OPTIONAL_FILES,m.OPTIONAL_FILES)
+        self.assertEqual(set(modules['receive'].BLOCKERS),set(m.BLOCKERS)|{m.PENDING,m.ROLLBACK_READY})
+        self.assertEqual(set(modules['audit'].BLOCKERS),set(modules['receive'].BLOCKERS))
 
 
 if __name__ == '__main__': unittest.main()

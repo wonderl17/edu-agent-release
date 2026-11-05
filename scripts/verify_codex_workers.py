@@ -152,7 +152,7 @@ console.log(JSON.stringify(output));
             started=True
             app.command(app.compose_argv()+['up','-d','--no-build','--pull','never','--wait','--wait-timeout','60','postgres','redis','web','model'],timeout=90)
             require(app.db("const r=await p.$queryRawUnsafe(\"SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema='public'\");console.log(r[0].count);",'web')==0,'FRESH_DATABASE_REQUIRED')
-            app.node("require('child_process').execFileSync('pnpm',['exec','prisma','db','push','--skip-generate'],{stdio:'inherit'});",'web',timeout=120)
+            app.node("require('child_process').execFileSync(process.execPath,['/app/node_modules/prisma/build/index.js','db','push','--skip-generate'],{stdio:'inherit'});",'web',timeout=120)
             app.db("await p.user.create({data:{id:'teacher',email:'synthetic-worker@example.invalid',role:'ADMIN'}});console.log('true');",'web')
             initial=seed('drain');start()
             wait_for(lambda:model()['active']==2,'BOTH_WORKERS_NOT_GENERATING')
