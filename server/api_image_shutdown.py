@@ -155,6 +155,18 @@ def validate_admission_runtime(value, flag):
     return True
 
 
+# Synthetic accounts must obey the candidate's real authentication contract.
+# Legacy clients omit this field; newer clients require an approved fixture.
+SYNTHETIC_CLASSROOM_SEED = r"""
+const fields=r('@prisma/client').Prisma.dmmf.datamodel.models.find(x=>x.name==='User').fields;
+const data={id:'teacher',email:'teacher@example.invalid',role:'ADMIN'};
+if(fields.some(x=>x.name==='registrationStatus'))data.registrationStatus='APPROVED';
+await p.user.create({data});
+const c=await p.classroom.create({data:{userId:'teacher',name:'synthetic shutdown class',subject:'数学'}});
+console.log(JSON.stringify(c.id));
+"""
+
+
 class Harness:
     def __init__(self, root, docker, images, project):
         self.root, self.docker, self.images, self.project = root, docker, images, project
@@ -492,7 +504,7 @@ def main():
         require(app.db("const r=await p.$queryRawUnsafe(\"SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema='public'\");console.log(r[0].n);")==0,'FRESH_DATABASE_REQUIRED')
         app.node("require('child_process').execFileSync(process.execPath,['/app/node_modules/prisma/build/index.js','db','push','--skip-generate'],{stdio:'inherit'})",timeout=120)
         report['admissionRuntime']=app.prepare_admission()
-        classroom=app.db("await p.user.create({data:{id:'teacher',email:'teacher@example.invalid',role:'ADMIN'}});const c=await p.classroom.create({data:{userId:'teacher',name:'synthetic shutdown class',subject:'数学'}});console.log(JSON.stringify(c.id));")
+        classroom=app.db(SYNTHETIC_CLASSROOM_SEED)
         version=json.loads(app.node("console.log(JSON.stringify(require('/app/package.json').version))"))
         require(version==args.version,'API_PACKAGE_VERSION_MISMATCH')
         app.command(app.argv()+['up','-d','--no-build','--pull','never','--wait','--wait-timeout','120','api'],timeout=150)

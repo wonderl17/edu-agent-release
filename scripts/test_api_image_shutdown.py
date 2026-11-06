@@ -73,6 +73,18 @@ class ImageShutdownSafety(unittest.TestCase):
                 path=Path(temporary)/(name+'.cjs');path.write_text(source)
                 subprocess.run(['node','--check',str(path)],check=True,capture_output=True)
 
+    def test_synthetic_teacher_is_approved_only_for_schemas_that_have_registration(self):
+        for supported in (False,True):
+            fields=[dict(name='id'),dict(name='role')]+([dict(name='registrationStatus')]if supported else[])
+            prefix="const writes=[];const fields="+json.dumps(fields)+";const r=()=>({Prisma:{dmmf:{datamodel:{models:[{name:'User',fields}]}}}});const p={user:{create:async({data})=>{writes.push(data)}},classroom:{create:async()=>({id:'fixture-class'})}};"
+            script=prefix+"(async()=>{"+acceptance.SYNTHETIC_CLASSROOM_SEED+"console.log(JSON.stringify(writes));})().catch(()=>process.exitCode=1);"
+            lines=subprocess.check_output(['node','--input-type=commonjs'],input=script.encode()).decode().splitlines()
+            self.assertEqual(json.loads(lines[0]),'fixture-class')
+            user=json.loads(lines[1])[0]
+            self.assertEqual(user['id'],'teacher');self.assertEqual(user['role'],'ADMIN')
+            if supported:self.assertEqual(user['registrationStatus'],'APPROVED')
+            else:self.assertNotIn('registrationStatus',user)
+
     def runtime(self,flag='true'):
         marker=dict(protocolVersion=2,role='api',entrySha256='e'*64,controlSha256='c'*64)
         return dict(flag=flag,manifest=marker,entrySha256='e'*64,controlSha256='c'*64)
