@@ -848,6 +848,7 @@ def candidate_override(h,m,web):
   runtime=ops.codex_module()
   require(all(callable(getattr(runtime,name,None))for name in('extension','load_settings','probe','inspect_api')),'CODEX_RUNTIME_ACTIVATION_NOT_INSTALLED')
   extra=runtime.extension(m['images']['codex-runtime']['tag'],m['runtime'],runtime.load_settings(ops))
+  require(extra.get('services',{}).get('codex-agent-runtime',{}).get('logging')=={'driver':'json-file','options':{'max-size':'20m','max-file':'5'}},'CODEX_RUNTIME_LOGGING_NOT_INSTALLED')
   for name,service in extra['services'].items():value['services'].setdefault(name,{}).update(service)
   value['networks']=extra['networks']
  return value

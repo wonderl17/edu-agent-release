@@ -9,7 +9,8 @@ import sys
 
 ROOT = Path('/opt/teaching-ai-production')
 TARGETS = ('operations/release/receiver.py', 'operations/release/api_drain.py',
-           'operations/release/codex_configure.py', 'operations/release/api_image_shutdown.py',
+           'operations/release/codex_configure.py', 'operations/release/codex_runtime.py',
+           'operations/release/api_image_shutdown.py',
            'operations/release/release_capacity.py','operations/release/maintenance_gate.py','operations/release/image_retention.py')
 OPTIONAL_FILES = frozenset('operations/release/' + name for name in
     ('api_drain.py','api_image_shutdown.py','release_capacity.py','maintenance_gate.py','image_retention.py'))

@@ -161,6 +161,16 @@ class ConfigurationTests(unittest.TestCase):
         for secret in [host.initial['runnerToken'],host.initial['egressToken'],request['settings']['runnerToken'],request['settings']['egressToken'],'teacher-synthetic']:
             self.assertNotIn(secret,evidence)
 
+    def test_old_generator_without_rotation_refuses_before_configuration_or_service_changes(self):
+        host=self.host();before=host.OVERRIDE.read_bytes()
+        legacy=runtime.extension(IMAGE,IDENTITY,host.request()['settings'])
+        legacy['services']['codex-agent-runtime'].pop('logging')
+        with patch.object(runtime,'trusted_extension',return_value=legacy):
+            with self.assertRaisesRegex(Refused,'CODEX_CONFIGURATION_LOGGING_NOT_INSTALLED'):
+                configure.apply(host,host.request())
+        self.assertEqual(host.OVERRIDE.read_bytes(),before)
+        self.assertNotIn('stop-api',host.events);self.assertFalse((host.STATE/configure.PENDING).exists())
+
     def test_stop_refuses_an_api_owned_by_another_project(self):
         host=self.host()
         record={'containers':configure.identities(host,host.records)}

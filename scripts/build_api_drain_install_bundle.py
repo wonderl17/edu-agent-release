@@ -23,6 +23,7 @@ SOURCES = {
     'receiver.py': REPO / 'server/tencent_receiver.py',
     'api_drain.py': REPO / 'server/api_drain.py',
     'codex_configure.py': REPO / 'server/codex_configure.py',
+    'codex_runtime.py': REPO / 'server/codex_runtime.py',
     'api_image_shutdown.py': REPO / 'server/api_image_shutdown.py',
     'release_capacity.py': REPO / 'server/release_capacity.py',
     'maintenance_gate.py': REPO / 'server/maintenance_gate.py',

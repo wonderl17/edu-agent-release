@@ -9,6 +9,7 @@ SERVICES = ('codex-agent-runtime',)
 NETWORKS = ('codex-api',)
 REGISTRY = 'docker.cnb.cool/shukezhinao/edu-agent-cloud-build/codex-runtime@sha256:'
 PROTOCOL = 'teaching-codex-plan-v1'
+RUNNER_LOGGING = {'driver': 'json-file', 'options': {'max-size': '20m', 'max-file': '5'}}
 API_KEYS = ('AGENT_WORKFLOWS_ENABLED', 'AGENT_ROLLOUT_MODE', 'AGENT_ROLLOUT_USER_IDS',
             'CODEX_AGENT_RUNNER_URL', 'CODEX_AGENT_RUNNER_TOKEN', 'CODEX_AGENT_EGRESS_ENABLED',
             'CODEX_AGENT_EGRESS_TOKEN', 'CODEX_AGENT_ALLOWED_MODEL_BASE_URLS', 'CODEX_AGENT_EGRESS_BIND_HOST')
@@ -67,6 +68,7 @@ def extension(image, runtime, config):
                   security_opt=['no-new-privileges:true'], restart='unless-stopped', stop_grace_period='15s')
     runner = dict(common, cpus=1, mem_limit='768m', pids_limit=128,
                   tmpfs=['/tmp:rw,noexec,nosuid,size=128m'], networks={'codex-api': None},
+                  logging=copy.deepcopy(RUNNER_LOGGING),
                   command=['node', 'server.mjs'], environment={
                       'NODE_ENV': 'production', 'HOST': '0.0.0.0', 'PORT': '4986',
                       'CODEX_AGENT_RUNNER_TOKEN': config['runnerToken'],
@@ -103,7 +105,11 @@ def strip_extension(base, candidate, expected):
         return candidate
     require(present == set(SERVICES), 'CODEX_RUNTIME_REQUIRED')
     for name in SERVICES:
-        require(candidate['services'][name] == expected['services'][name], 'CODEX_SERVICE_POLICY')
+        trusted = copy.deepcopy(expected['services'][name])
+        # Only the exact pre-rotation Compose shape remains readable for a running
+        # old release. New candidate generators always require RUNNER_LOGGING.
+        if 'logging' not in candidate['services'][name]: trusted.pop('logging', None)
+        require(candidate['services'][name] == trusted, 'CODEX_SERVICE_POLICY')
         del candidate['services'][name]
     for name in NETWORKS:
         require(candidate.get('networks', {}).get(name) == expected['networks'][name], 'CODEX_NETWORK_POLICY')
@@ -129,6 +135,10 @@ def inspect_isolation(container, name, expected):
             not host.get('PortBindings') and not host.get('Devices') and not host.get('DeviceRequests') and
             host.get('PidMode', '') == '' and host.get('IpcMode') == 'private' and
             host.get('SecurityOpt') == ['no-new-privileges:true'], 'CODEX_ACTUAL_ISOLATION')
+    intended_logging = service.get('logging')
+    require(intended_logging is None or intended_logging == RUNNER_LOGGING, 'CODEX_LOGGING_POLICY')
+    expected_logging = {'Type': 'json-file', 'Config': {} if intended_logging is None else RUNNER_LOGGING['options']}
+    require(host.get('LogConfig') == expected_logging, 'CODEX_ACTUAL_LOGGING')
     require(config.get('Cmd') == service['command'] and not config.get('Entrypoint'), 'CODEX_ACTUAL_COMMAND')
     require(set(container['NetworkSettings']['Networks']) == {PROJECT+'_'+x for x in service['networks']}, 'CODEX_ACTUAL_NETWORKS')
     require(all(m.get('Type') == 'tmpfs' and m.get('Destination') == '/tmp' for m in container.get('Mounts', [])), 'CODEX_ACTUAL_MOUNTS')

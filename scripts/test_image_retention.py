@@ -145,6 +145,30 @@ class RetentionTests(unittest.TestCase):
         self.write(receipt,dict(status='unknown',bundleSha256='1'*64))
         with self.assertRaisesRegex(ValueError,'RETENTION_RECEIPT_INVALID'):self.target.make_plan()
 
+    def test_legacy_unbound_receipt_is_explicitly_pinned_not_counted_as_success(self):
+        path=self.root/'releases'/('1'*40)/('1'*64)/'deployment-receipt.json'
+        self.write(path,dict(status='deployed',sourceSha='1'*40,deployedAt='2100-01-01T00:00:00Z',verification={'healthy':True}))
+        self.write(self.ops/'image-retention-policy.json',dict(schemaVersion=1,retainSuccessfulPackages=2,
+            protectedPackageHashes=[],releasedPackageHashes=['1'*64]))
+        plan=self.target.make_plan()
+        self.assertEqual([x['id']for x in plan['images']],['sha256:'+'2'*64])
+        row=next(x for x in plan['protected']if x['id']=='sha256:'+'1'*64)
+        self.assertIn('unverified-receipt:'+'1'*64,row['reasons'])
+        self.assertEqual(next(x for x in plan['packages']if x['packageHash']=='1'*64)['receiptState'],'unverified')
+
+    def test_unknown_receipt_schema_is_pinned_but_corruption_or_identity_conflicts_refuse(self):
+        path=self.root/'releases'/('1'*40)/('1'*64)/'deployment-receipt.json'
+        legacy=dict(schemaVersion=99,status='deployed',sourceSha='1'*40,bundleSha256='1'*64,
+            deployedAt='2026-11-01T00:00:00Z',verification={'healthy':True})
+        self.write(path,legacy)
+        self.assertNotIn('sha256:'+'1'*64,[x['id']for x in self.target.make_plan()['images']])
+        for field,value in [('sourceSha','f'*40),('bundleSha256','f'*64)]:
+            self.write(path,dict(legacy,**{field:value}))
+            with self.subTest(field=field),self.assertRaisesRegex(ValueError,'RETENTION_RECEIPT_IDENTITY'):self.target.make_plan()
+        path.write_bytes(b'{broken json');path.chmod(0o600)
+        with self.assertRaises(ValueError):self.target.make_plan()
+        self.assertFalse(any(x[:2]==['image','rm']for x in self.commands))
+
     def test_active_transfer_overrides_explicit_release_and_expired_transfer_needs_review(self):
         policy=dict(schemaVersion=1,retainSuccessfulPackages=2,protectedPackageHashes=[],releasedPackageHashes=['1'*64])
         self.write(self.ops/'image-retention-policy.json',policy)

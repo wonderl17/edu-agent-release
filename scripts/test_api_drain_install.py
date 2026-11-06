@@ -79,10 +79,18 @@ class InstallTests(unittest.TestCase):
         self.f.installer.apply()
         final=events.index((m.RECEIVER,self.f.after[m.RECEIVER]))
         self.assertLess(events.index((m.RECEIVER,m.GATE)),final)
-        for name in ('release_capacity.py','maintenance_gate.py','image_retention.py'):
+        for name in ('release_capacity.py','maintenance_gate.py','image_retention.py','codex_runtime.py'):
             target='operations/release/'+name
-            self.assertIsNone(self.f.before[target])
+            if name!='codex_runtime.py':self.assertIsNone(self.f.before[target])
             self.assertLess(events.index((target,self.f.after[target])),final)
+
+    def test_existing_runtime_policy_is_required_and_installed_as_same_transaction(self):
+        target='operations/release/codex_runtime.py'
+        self.assertIn(target,m.FILES);self.assertNotIn(target,m.OPTIONAL_FILES)
+        (self.f.root/target).unlink()
+        with self.assertRaisesRegex(ValueError,'DRAIN_INSTALL_STALE_SOURCE'):self.f.installer.apply()
+        self.assertIsNone(self.f.read(m.PENDING));self.assertIsNone(self.f.read(m.ROLLBACK_READY))
+        for name in set(m.FILES)-{target}:self.assertEqual(self.f.read(name),self.f.before[name])
 
     def test_admission_and_shared_gate_pending_state_block_install_without_writes(self):
         for name in ('release-admission.pending.json','maintenance-gate.pending.json'):
@@ -323,7 +331,7 @@ inst.apply()
         message = json.loads(raw); message['files']['files/api_drain.py'] = base64.b64encode(b'changed').decode()
         with self.assertRaisesRegex(ValueError, 'DRAIN_RECEIVE_MANIFEST_REFUSED'):
             endpoint.receive(json.dumps(message).encode(), bundle.name)
-        for helper in ('release_capacity.py','maintenance_gate.py','image_retention.py'):
+        for helper in ('release_capacity.py','maintenance_gate.py','image_retention.py','codex_runtime.py'):
             message=json.loads(raw);del message['files']['files/'+helper]
             with self.assertRaisesRegex(ValueError,'DRAIN_RECEIVE_MEMBERS_REFUSED'):
                 endpoint.receive(json.dumps(message).encode(),bundle.name)

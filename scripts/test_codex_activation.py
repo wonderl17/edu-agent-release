@@ -57,6 +57,15 @@ class ActivationTests(unittest.TestCase):
             self.assertEqual(value['services']['api']['environment']['AGENT_ROLLOUT_USER_IDS'], ','.join(ids))
             self.assertEqual(value['services']['codex-agent-runtime'], runtime.extension(IMAGE, IDENTITY, config)['services']['codex-agent-runtime'])
 
+    def test_candidate_refuses_a_policy_without_exact_runner_log_rotation(self):
+        receiver=self.receiver
+        receiver.ops=types.SimpleNamespace(codex_module=lambda:runtime,codex_context=lambda:None)
+        legacy=runtime.extension(IMAGE,IDENTITY,configuration())
+        legacy['services']['codex-agent-runtime'].pop('logging')
+        with patch.object(runtime,'load_settings',return_value=configuration()),patch.object(runtime,'extension',return_value=legacy):
+            with self.assertRaisesRegex(receiver.Refused,'CODEX_RUNTIME_LOGGING_NOT_INSTALLED'):
+                receiver.candidate_override({},package(),Path('/synthetic/web'))
+
     def test_incomplete_host_support_refuses_before_candidate_write_or_commands(self):
         receiver = self.receiver
         for ops in (types.SimpleNamespace(), types.SimpleNamespace(codex_module=lambda: runtime),

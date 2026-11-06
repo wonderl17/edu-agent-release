@@ -23,6 +23,7 @@ SCOPE = 'teaching-production-api-drain-update-v1'
 RECEIVER = 'operations/release/receiver.py'
 FILES = {RECEIVER: 'receiver.py', 'operations/release/api_drain.py': 'api_drain.py',
          'operations/release/codex_configure.py': 'codex_configure.py',
+         'operations/release/codex_runtime.py': 'codex_runtime.py',
          'operations/release/api_image_shutdown.py': 'api_image_shutdown.py',
          'operations/release/release_capacity.py': 'release_capacity.py',
          'operations/release/maintenance_gate.py': 'maintenance_gate.py',

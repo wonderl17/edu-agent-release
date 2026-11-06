@@ -64,7 +64,7 @@ Root-only successful proofs bind the source/version, immutable API digest and ac
 
 ### Matched host helper update
 
-The hash-bound installer now installs seven files: `receiver.py`, `api_drain.py`, `codex_configure.py`, `api_image_shutdown.py`, `release_capacity.py`, `maintenance_gate.py`, and `image_retention.py`. Newly introduced helpers may be absent in the read-only audit; existing file hashes, the fixed Production root, startup policy hash and service/container/image/start identities must match. It obtains the existing release and maintenance locks, refuses pending release/admission/gate/install state, fences the old receiver, installs dependencies first and exposes the new receiver last. It does not restart services, run migrations, build products, activate admission, delete images or change storage. A crash preserves a same-bundle recovery journal, including bytes and absence of previously missing files.
+The hash-bound installer now installs eight files: `receiver.py`, `api_drain.py`, `codex_configure.py`, `api_image_shutdown.py`, `release_capacity.py`, `maintenance_gate.py`, `image_retention.py`, and `codex_runtime.py`. Newly introduced helpers may be absent in the read-only audit; existing file hashes, the fixed Production root, startup policy hash and service/container/image/start identities must match. It obtains the existing release and maintenance locks, refuses pending release/admission/gate/install state, fences the old receiver, installs dependencies first and exposes the new receiver last. It does not restart services, run migrations, build products, activate admission, delete images or change storage. The matched runner policy accepts the exact existing logging contract for current-service inspection, while every new candidate requires bounded `json-file` rotation (`20m`, five files); actual Docker LogConfig must agree. A crash preserves a same-bundle recovery journal, including bytes and absence of previously missing files.
 
 Run the tests, review these sources, then freeze their SHA-256 values. Use a canonical absolute local directory owned by the operator with mode `0700`; its audit, review and transport records remain private. The existing fixed SSH identity and known-host file are also used by the sender. The following audit is read-only:
 
@@ -79,7 +79,7 @@ ssh -F /dev/null -T -i /Users/wonderl/.ssh/teaching-ai-tencent-validation \
   < server/api_drain_install_audit.py > "$TASK_RELEASE_REVIEW_DIR/host-audit.json"
 ```
 
-After review, write the frozen source map (`installer` and the seven payload filenames) and a separately reviewed transport receiver hash. The builder rejects any source change after this step:
+After review, write the frozen source map (`installer` and the eight payload filenames) and a separately reviewed transport receiver hash. The builder rejects any source change after this step:
 
 ```sh
 python3 - "$TASK_RELEASE_REVIEW_DIR" <<'PY'

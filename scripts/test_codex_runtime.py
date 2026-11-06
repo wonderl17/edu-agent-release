@@ -91,6 +91,16 @@ class RuntimePolicyTests(unittest.TestCase):
         changed=copy.deepcopy(candidate);changed['services']['postgres']['image']='unapproved'
         self.assertNotEqual(runtime.strip_extension(base,changed,expected),base)
 
+    def test_new_runner_candidates_rotate_logs_and_legacy_compose_is_narrowly_accepted(self):
+        base,candidate,expected=self.candidate()
+        self.assertEqual(candidate['services']['codex-agent-runtime']['logging'], runtime.RUNNER_LOGGING)
+        old=copy.deepcopy(candidate);old['services']['codex-agent-runtime'].pop('logging')
+        self.assertEqual(runtime.strip_extension(base,old,expected),base)
+        for logging in ({'driver':'json-file','options':{}}, {'driver':'json-file','options':{'max-size':'1g','max-file':'50'}}, {'driver':'none'}, {'driver':'local','options':{'max-size':'20m','max-file':'5'}}):
+            changed=copy.deepcopy(candidate);changed['services']['codex-agent-runtime']['logging']=logging
+            with self.subTest(logging=logging),self.assertRaisesRegex(ValueError,'SERVICE_POLICY'):
+                runtime.strip_extension(base,changed,expected)
+
     def test_old_packages_need_no_runtime_settings_and_preserve_the_old_policy_view(self):
         base,_,_=self.candidate()
         self.assertEqual(runtime.strip_extension(base,base,None),base)
@@ -113,10 +123,15 @@ class RuntimePolicyTests(unittest.TestCase):
         expected=runtime.extension(IMAGE,IDENTITY,configuration());name=runtime.SERVICES[0]
         service=expected['services'][name];service['mem_limit']='805306368'
         actual=dict(HostConfig=dict(ReadonlyRootfs=True,Privileged=False,CapDrop=['ALL'],SecurityOpt=['no-new-privileges:true'],
-                    IpcMode='private',Tmpfs={'/tmp':'rw,noexec,nosuid,size=128m'},PidsLimit=128,Memory=805306368,NanoCpus=1000000000),
+                    IpcMode='private',Tmpfs={'/tmp':'rw,noexec,nosuid,size=128m'},PidsLimit=128,Memory=805306368,NanoCpus=1000000000,LogConfig={'Type':'json-file','Config':{'max-size':'20m','max-file':'5'}}),
                     Config=dict(User='1000:1000',Cmd=['node','server.mjs'],Env=[k+'='+v for k,v in service['environment'].items()]),
                     Mounts=[],NetworkSettings=dict(Networks={runtime.PROJECT+'_'+n:{} for n in service['networks']}))
         runtime.inspect_isolation(actual,name,expected)
+        legacy=copy.deepcopy(expected);legacy['services'][name].pop('logging')
+        old=copy.deepcopy(actual);old['HostConfig']['LogConfig']={'Type':'json-file','Config':{}}
+        runtime.inspect_isolation(old,name,legacy)
+        with self.assertRaisesRegex(ValueError,'ACTUAL_LOGGING'):runtime.inspect_isolation(old,name,expected)
+        with self.assertRaisesRegex(ValueError,'ACTUAL_LOGGING'):runtime.inspect_isolation(actual,name,legacy)
         for change in (lambda x:x['HostConfig'].update(Memory=0),lambda x:x['HostConfig'].update(NanoCpus=0),
                        lambda x:x['Config']['Env'].append('DATABASE_URL=secret')):
             value=copy.deepcopy(actual);change(value)

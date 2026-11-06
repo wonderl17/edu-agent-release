@@ -203,19 +203,30 @@ class Retention:
                     require(value.get('sourceSha')==parts[1] and key not in packages,'RETENTION_MANIFEST_IDENTITY')
                     packages[key] = value
                 else: receipts.setdefault(key,[]).append((parts[3],value))
-        successful = []
+        successful = []; unverified = set()
         for key, values in receipts.items():
             for name, value in values:
                 if name=='deployment-receipt.json':
-                    require(value.get('status')=='deployed','RETENTION_RECEIPT_INVALID')
-                if name=='deployment-receipt.json' and value.get('status')=='deployed':
-                    require(value.get('bundleSha256')==key and isinstance(value.get('deployedAt'),str),'RETENTION_RECEIPT_INVALID')
-                    require(value.get('verification',{}).get('healthy') is True,'RETENTION_RECEIPT_UNVERIFIED')
+                    require(value.get('status')=='deployed' and key in packages,'RETENTION_RECEIPT_INVALID')
+                    manifest = packages[key]
+                    for field in ('sourceSha','version','sourceRepository'):
+                        if field in value and field in manifest:
+                            require(value[field]==manifest[field],'RETENTION_RECEIPT_IDENTITY')
+                    if 'bundleSha256' in value:
+                        require(value['bundleSha256']==key,'RETENTION_RECEIPT_IDENTITY')
+                    require(isinstance(value.get('deployedAt'),str),'RETENTION_RECEIPT_INVALID')
+                    require(isinstance(value.get('verification'),dict) and value['verification'].get('healthy') is True,'RETENTION_RECEIPT_UNVERIFIED')
                     moment = dt.datetime.fromisoformat(value['deployedAt'].replace('Z','+00:00'))
                     require(moment.tzinfo is not None,'RETENTION_RECEIPT_TIME')
-                    successful.append((moment,key))
+                    unknown_schema = 'schemaVersion' in value and (type(value['schemaVersion']) is not int or value['schemaVersion']!=1)
+                    if 'bundleSha256' not in value or unknown_schema:
+                        # A recognized historical source in an exact safe package
+                        # directory is visible but never proof for deletion.
+                        require(value.get('sourceSha')==manifest['sourceSha'],'RETENTION_RECEIPT_IDENTITY')
+                        unverified.add(key)
+                    else: successful.append((moment,key))
         recent = {key for _,key in sorted(successful,reverse=True)[:policy['retainSuccessfulPackages']]}
-        pinned = set(policy['protectedPackageHashes'])|recent
+        pinned = set(policy['protectedPackageHashes'])|recent|unverified
         released = set(policy['releasedPackageHashes'])
         for name,data in raw.items():
             if name.endswith('.yaml'): continue
@@ -244,8 +255,9 @@ class Retention:
             has_success = any(name=='deployment-receipt.json' for name,_ in receipts.get(key,[]))
             protected = key in pinned or key not in released and (unresolved or not has_success)
             for image in package_images:
-                if protected: pin(image,'package:'+key)
-            summaries.append({'packageHash':key,'protected':protected,'images':sorted(set(package_images))})
+                if protected: pin(image,('unverified-receipt:' if key in unverified else 'package:')+key)
+            summaries.append({'packageHash':key,'protected':protected,'images':sorted(set(package_images)),
+                              'receiptState':'unverified' if key in unverified else 'verified_success' if has_success else 'unconfirmed'})
         # Historical previous overrides remain recovery material until that source's package is released.
         released_sources = {m.get('sourceSha') for key,m in packages.items() if key in released}
         for name,data in raw.items():
