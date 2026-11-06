@@ -247,8 +247,9 @@ class RuntimeProducerTests(unittest.TestCase):
                         content = dict(version='0.0.126',buildSha='a'*40) if 'version.json' in args[2] else image_values[args[2].split(':',1)[1]]
                         Path(args[3]).write_bytes(contract.canonical(content))
                     return b''
-                def build(jobs, *args):
+                def build(jobs, *args, **kwargs):
                     self.assertEqual({job[0] for job in jobs}, set(value['images']))
+                    self.assertEqual(kwargs['identity'],dict(sourceSha='a'*40,version='0.0.126'))
                     return copy.deepcopy(value['images']), {key:1 for key in value['images']}
                 published=[]
                 def publish(request, **kwargs):

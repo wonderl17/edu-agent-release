@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Run only in the private CNB project; no Production or GitHub credentials."""
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,12 +12,17 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from cnb_release import (REPO, REGISTRY, SOURCE, SHA, DIGEST, canonical, validate_manifest,
                          RUNTIME_KIND, RUNTIME_ROOT, RUNTIME_LABELS, filesystem_runtime, inspect_runtime_image)
 
 CODEX_CACHE_KIND = "codex-runtime"
+IMAGE_MANIFEST_TYPES = frozenset(("application/vnd.oci.image.manifest.v1+json",
+                                 "application/vnd.docker.distribution.manifest.v2+json"))
+IMAGE_CONFIG_TYPES = frozenset(("application/vnd.oci.image.config.v1+json",
+                               "application/vnd.docker.container.image.v1+json"))
 
 
 def run(args, **kwargs):
@@ -48,10 +55,112 @@ def stop_builds(active):
         process.wait()
 
 
-def build_images(jobs, source, docker_env, directory, concurrency=2, timeout=5400):
+class NoRegistryRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+def registry_config_bytes(kind, digest, docker_env):
+    """Read one small config blob; credentials only reach the fixed CNB registry."""
+    if kind not in ("api", "worker", "web", CODEX_CACHE_KIND) or not isinstance(digest, str) or not DIGEST.fullmatch(digest):
+        raise ValueError("registry config scope")
+    config = json.loads((Path(docker_env["DOCKER_CONFIG"]) / "config.json").read_text())
+    auth = config.get("auths", {}).get("docker.cnb.cool", {}).get("auth")
+    if not isinstance(auth, str) or not 0 < len(auth) <= 32768:
+        raise ValueError("registry config authentication")
+    decoded = base64.b64decode(auth, validate=True)
+    if b":" not in decoded or any(x in decoded for x in (b"\n", b"\r", b"\0")):
+        raise ValueError("registry config authentication")
+    opener = build_opener(NoRegistryRedirect())
+    def read(request, limit):
+        with opener.open(request, timeout=30) as response:
+            raw = response.read(limit + 1)
+        if not 0 < len(raw) <= limit:
+            raise ValueError("registry config response limit")
+        return raw
+    query = urlencode({"service": "cnb-registry", "scope": "repository:" + REPO + "/" + kind + ":pull"})
+    token = json.loads(read(Request("https://docker.cnb.cool/service/token?" + query,
+        headers={"Authorization": "Basic " + auth, "Accept": "application/json"}), 65536))
+    token = token.get("token", token.get("access_token")) if isinstance(token, dict) else None
+    if not isinstance(token, str) or not 0 < len(token) <= 65536 or any(x in token for x in ("\n", "\r", "\0")):
+        raise ValueError("registry config token")
+    return read(Request("https://docker.cnb.cool/v2/" + REPO + "/" + kind + "/blobs/" + digest,
+                        headers={"Authorization": "Bearer " + token}), 1024 ** 2)
+
+
+def image_identity_from_metadata(value, kind, docker_env, identity=None):
+    """Resolve missing exporter metadata from the exact pushed image, never a tag/cache."""
+    if not isinstance(value, dict) or kind not in ("api", "worker", "web", CODEX_CACHE_KIND):
+        raise ValueError("build metadata")
+    digest = value.get("containerimage.digest")
+    if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
+        raise ValueError("build digest")
+    descriptor = value.get("containerimage.descriptor")
+    if descriptor is not None and (not isinstance(descriptor, dict) or descriptor.get("digest") != digest or
+                                  descriptor.get("mediaType") not in IMAGE_MANIFEST_TYPES):
+        raise ValueError("build descriptor")
+    if descriptor is not None and "platform" in descriptor:
+        platform = descriptor["platform"]
+        if not isinstance(platform, dict) or platform.get("os") != "linux" or platform.get("architecture") != "amd64":
+            raise ValueError("build descriptor platform")
+    annotations = descriptor.get("annotations", {}) if descriptor is not None else {}
+    if not isinstance(annotations, dict):
+        raise ValueError("build descriptor annotations")
+    annotated = annotations.get("config.digest")
+    if "config.digest" in annotations and (not isinstance(annotated, str) or not DIGEST.fullmatch(annotated)):
+        raise ValueError("build descriptor config")
+    if "containerimage.config.digest" in value:
+        config = value["containerimage.config.digest"]
+        if not isinstance(config, str) or not DIGEST.fullmatch(config):
+            raise ValueError("build config digest")
+        if annotated is not None and annotated != config:
+            raise ValueError("build config conflict")
+        return digest, config
+    # Some completed image+registry-cache exports omit this convenience field.
+    # The immutable manifest's SHA-256 and config descriptor remain authoritative.
+    reference = REGISTRY + "/" + kind + "@" + digest
+    raw = run(["docker", "buildx", "imagetools", "inspect", "--raw", reference], env=docker_env, timeout=60)
+    if not isinstance(raw, bytes) or not 0 < len(raw) <= 1024 ** 2 or "sha256:" + hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError("build manifest digest")
+    manifest = json.loads(raw)
+    if (not isinstance(manifest, dict) or type(manifest.get("schemaVersion")) is not int or
+            manifest["schemaVersion"] != 2 or manifest.get("mediaType") not in IMAGE_MANIFEST_TYPES):
+        raise ValueError("build image manifest")
+    if descriptor is not None and (descriptor["mediaType"] != manifest["mediaType"] or
+            ("size" in descriptor and (type(descriptor["size"]) is not int or descriptor["size"] != len(raw)))):
+        raise ValueError("build descriptor content")
+    config = manifest.get("config")
+    if (not isinstance(config, dict) or config.get("mediaType") not in IMAGE_CONFIG_TYPES or
+            not isinstance(config.get("digest"), str) or not DIGEST.fullmatch(config["digest"]) or
+            type(config.get("size")) is not int or not 0 < config["size"] <= 1024 ** 2):
+        raise ValueError("build image config")
+    if annotated is not None and annotated != config["digest"]:
+        raise ValueError("build config conflict")
+    raw_config = registry_config_bytes(kind, config["digest"], docker_env)
+    if (not isinstance(raw_config, bytes) or len(raw_config) != config["size"] or
+            "sha256:" + hashlib.sha256(raw_config).hexdigest() != config["digest"]):
+        raise ValueError("build config content")
+    content = json.loads(raw_config)
+    if not isinstance(content, dict) or content.get("os") != "linux" or content.get("architecture") != "amd64":
+        raise ValueError("build config platform")
+    if identity is not None:
+        image_config = content.get("config")
+        labels = image_config.get("Labels") if isinstance(image_config, dict) else None
+        if (not isinstance(labels, dict) or labels.get("org.opencontainers.image.revision") != identity["sourceSha"] or
+                labels.get("org.opencontainers.image.version") != identity["version"]):
+            raise ValueError("build config source")
+    print("CNB build metadata: " + kind + " config verified from immutable image manifest.", flush=True)
+    return digest, config["digest"]
+
+
+def build_images(jobs, source, docker_env, directory, concurrency=2, timeout=5400, identity=None):
     """Bounded parallel builds; no receipt or next job after any failed validation."""
     if type(concurrency) is not int or concurrency not in (1, 2):
         raise ValueError("build concurrency")
+    if identity is not None and (not isinstance(identity, dict) or set(identity) != {"sourceSha", "version"} or
+            not isinstance(identity["sourceSha"], str) or not SHA.fullmatch(identity["sourceSha"]) or
+            not isinstance(identity["version"], str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", identity["version"])):
+        raise ValueError("build identity")
     pending, active, images, timings = list(jobs), {}, {}, {}
     try:
         while pending or active:
@@ -69,21 +178,8 @@ def build_images(jobs, source, docker_env, directory, concurrency=2, timeout=540
                 if result:
                     raise subprocess.CalledProcessError(result, process.args)
                 value = json.loads(metadata.read_text())
-                digest = value.get("containerimage.digest")
-                if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
-                    raise ValueError("build digest")
-                ref = REGISTRY + "/" + kind + "@" + digest
-                if "containerimage.config.digest" in value:
-                    config = value["containerimage.config.digest"]
-                else:
-                    # BuildKit may omit the config digest from exporter metadata.
-                    # Resolve the real image ID using the immutable pushed digest.
-                    run(["docker", "pull", ref], env=docker_env)
-                    config = run(["docker", "image", "inspect", "--format", "{{.Id}}", ref],
-                                 env=docker_env).decode().strip()
-                if not isinstance(config, str) or not DIGEST.fullmatch(config):
-                    raise ValueError("build digest")
-                images[kind] = {"ref": ref, "id": config}
+                digest, config = image_identity_from_metadata(value, kind, docker_env, identity)
+                images[kind] = {"ref": REGISTRY + "/" + kind + "@" + digest, "id": config}
                 timings[kind] = round(time.monotonic() - start, 3)
                 log.close()
                 del active[kind]
@@ -210,7 +306,8 @@ def main():
         # CNB provides a rootless Docker/BuildKit service with registry cache.
         # A nested docker-container driver cannot mount sysfs in that service.
         jobs = image_jobs(sha, version, request_id, directory, cache_tag, runtime)
-        images, timings = build_images(jobs, source, docker_env, directory, int(concurrency))
+        images, timings = build_images(jobs, source, docker_env, directory, int(concurrency),
+                                       identity={"sourceSha": sha, "version": version})
         # Verify the actual Web bytes before making a completion receipt.
         run(["docker", "pull", images["web"]["ref"]], env=docker_env)
         container = run(["docker", "create", images["web"]["ref"]], env=docker_env).decode().strip()
