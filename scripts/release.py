@@ -270,10 +270,15 @@ def main():
             # only those verified release assets, without changing that result.
             print("Release controller stage: public-installers.", flush=True)
             mirror_token = installation_token(repository, "read")
-            mirror_installers(source_repository=repository, version=version, source_token=mirror_token,
-                              public_repository=public_repository, public_sha=os.environ["GITHUB_SHA"],
-                              public_token=public_token, temporary=temporary,
-                              local_release_dir=source / "apps/desktop/release-velopack" if operation == "desktop" else None)
+            mirror_started = time.perf_counter()
+            try:
+                mirror_installers(source_repository=repository, version=version, source_token=mirror_token,
+                                  public_repository=public_repository, public_sha=os.environ["GITHUB_SHA"],
+                                  public_token=public_token, temporary=temporary,
+                                  local_release_dir=source / "apps/desktop/release-velopack" if operation == "desktop" else None)
+            finally:
+                elapsed = min(10800000,max(0,round((time.perf_counter()-mirror_started)*1000)))
+                print(f"Desktop timing: D_PUBLIC_MIRROR all {elapsed} ms.", flush=True)
         if result:
             raise RuntimeError("Private stage failed")
         print("Release controller complete.", flush=True)

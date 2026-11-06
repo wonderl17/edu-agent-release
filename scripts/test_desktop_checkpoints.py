@@ -54,6 +54,26 @@ class CheckpointTests(unittest.TestCase):
         self.channel.path.write_text("D_ELECTRON success mac-arm64 12345\nD_ELECTRON success PRIVATE_VALUE 5\nD_VPK_PACK success all -1\nD_VPK_PACK success all 99999999\nD_VPK_PACK success all 1.1\n")
         self.assertEqual(self.report(), "Desktop checkpoint: D_ELECTRON success.\nDesktop timing: D_ELECTRON mac-arm64 12345 ms.\n")
 
+    def test_cache_results_are_reconstructed_only_from_finite_fields(self):
+        self.channel.path.write_text('CACHE_RESULT restore hit VALIDATED\nCACHE_RESULT restore hit PRIVATE_SECRET\n'
+                                     'CACHE_RESULT save hit VALIDATED\nCACHE_RESULT private hit VALIDATED\n'
+                                     'CACHE_RESULT save unchanged BASELINE_MATCH\n')
+        self.assertEqual(self.report(),'Desktop cache result: mode=restore; status=hit; reason=VALIDATED.\n'
+                                      'Desktop cache result: mode=save; status=unchanged; reason=BASELINE_MATCH.\n')
+
+    @unittest.skipUnless(NODE, 'Node is required for actual preload')
+    def test_cache_cli_private_output_stays_private_while_fixed_results_are_observed(self):
+        entry=self.root/'desktop-build-cache.mjs'
+        entry.write_text('console.log('+json.dumps(SENTINEL)+');\n'
+                         'process.stdout.write("Desktop cache result: mode=restore; ");\n'
+                         'process.stdout.write("status=miss; reason=IDENTITY_CHANGED.\\n");\n'
+                         'console.log("Desktop cache result: mode=restore; status=hit; reason=PRIVATE_VALUE.");\n')
+        result=subprocess.run([NODE,'--require',str(PRELOAD),str(entry)],
+            env={**os.environ,checkpoints.FILE_ENV:str(self.channel.path)},capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn(SENTINEL,result.stdout) # Original output is preserved for its private consumer.
+        self.assertEqual(self.report(),'Desktop cache result: mode=restore; status=miss; reason=IDENTITY_CHANGED.\n')
+
     def test_symlinks_foreign_paths_and_oversized_channels_are_rejected(self):
         target = self.root / "secret"
         target.write_text(SENTINEL)

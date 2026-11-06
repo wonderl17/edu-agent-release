@@ -193,6 +193,7 @@ def apply(c, request):
         raw=c.decode(current_override); runtime=raw.get('services',{}).get('codex-agent-runtime',{})
         c.require('image'in runtime,'CODEX_CONFIGURATION_RUNTIME_REQUIRED')
         extra=policy.trusted_extension(c.ops.codex_context(),runtime['image'],desired)
+        c.require(extra.get('services',{}).get('codex-agent-runtime',{}).get('logging')=={'driver':'json-file','options':{'max-size':'20m','max-file':'5'}},'CODEX_CONFIGURATION_LOGGING_NOT_INSTALLED')
         candidate=copy.deepcopy(raw)
         for name in policy.SERVICES:candidate['services'][name]=extra['services'][name]
         candidate['services']['api']['environment'].update(extra['services']['api']['environment'])

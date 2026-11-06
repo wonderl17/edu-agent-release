@@ -134,7 +134,7 @@ console.log(JSON.stringify({status:db.status,error:db.errorMessage,result:db.res
         try:
             app.command(app.compose_argv()+['up','-d','--no-build','--pull','never','--wait','--wait-timeout','60','postgres','redis','web','model','storage'],timeout=90)
             require(app.db("const r=await p.$queryRawUnsafe(\"SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema='public'\");console.log(r[0].n)",'web')==0,'FRESH_DATABASE_REQUIRED')
-            app.node("require('child_process').execFileSync('pnpm',['exec','prisma','migrate','deploy'],{stdio:'inherit'})",'web',timeout=120)
+            app.node("require('child_process').execFileSync(process.execPath,['/app/node_modules/prisma/build/index.js','migrate','deploy'],{stdio:'inherit'})",'web',timeout=120)
             app.node("const{S3Client,CreateBucketCommand}=require('module').createRequire('/app/apps/api/package.json')('@aws-sdk/client-s3');new S3Client({endpoint:process.env.OBJECT_STORAGE_ENDPOINT,region:'us-east-1',forcePathStyle:true,credentials:{accessKeyId:process.env.OBJECT_STORAGE_ACCESS_KEY_ID,secretAccessKey:process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY}}).send(new CreateBucketCommand({Bucket:'grading-proof'})).then(()=>console.log('ready'))",'web')
             identities=app.db("const u=await p.user.create({data:{email:'synthetic-grading@example.invalid'}}),s=await p.student.create({data:{userId:u.id,name:'合成学生'}});console.log(JSON.stringify({userId:u.id,studentId:s.id}))",'web')
             if args.scenario=='full':

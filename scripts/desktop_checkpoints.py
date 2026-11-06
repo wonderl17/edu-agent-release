@@ -15,10 +15,12 @@ STAGES = frozenset((
     "D_ENTRY", "D_TOOLCHAIN", "D_DEPENDENCIES", "D_CHANGELOG", "D_NODE_CHECK",
     "D_VPK_SETUP", "D_WINDOWS_SETUP", "D_MAC_SIGN", "D_PACKAGE", "D_PREFLIGHT",
     "D_WEB_BUILD", "D_VITE", "D_SIDECAR", "D_ELECTRON", "D_LATEX", "D_PDF",
-    "D_VPK_DOWNLOAD", "D_VPK_PACK", "D_VPK_DELTA", "D_VERIFY", "D_R2_PUBLISH",
+    "D_VPK_DOWNLOAD", "D_VPK_PACK", "D_VPK_DELTA", "D_VERIFY", "D_R2_PUBLISH", "D_R2_STAGE", "D_COS_PUBLISH", "D_GITHUB_PRIVATE_UPLOAD",
     "D_FINAL_PUBLISH", "D_RESUME", "D_TOKEN_REFRESH", "D_CACHE_RESTORE", "D_CACHE_SAVE",
 ))
 STATES = frozenset(("start", "success", "failure"))
+CACHE_REASONS = frozenset(('VALIDATED','NOT_FOUND','IDENTITY_CHANGED','INVALID_CACHE','TRANSFER_FAILED',
+    'ARCHIVE_FAILED','LOCAL_IO','CONFIG_UNAVAILABLE','CONFIG_INVALID','BASELINE_MATCH','UPLOADED','SIZE_LIMIT'))
 
 
 def without_checkpoint_environment(environment):
@@ -60,6 +62,12 @@ def report_checkpoints(path):
         records = deque(maxlen=MAX_RECORDS)
         for line in data.splitlines():
             parts = line.split(b" ")
+            if len(parts)==4 and parts[0]==b'CACHE_RESULT':
+                try: mode, result, reason = (part.decode('ascii') for part in parts[1:])
+                except UnicodeDecodeError: continue
+                statuses = ('hit','miss','unavailable') if mode=='restore' else ('saved','unchanged','unavailable') if mode=='save' else ()
+                if result in statuses and reason in CACHE_REASONS:records.append(('CACHE_RESULT',mode,result,reason))
+                continue
             if len(parts) not in (2, 4):
                 continue
             try:
@@ -76,6 +84,9 @@ def report_checkpoints(path):
                         continue
                 records.append((stage, state, scope, elapsed))
         for stage, state, scope, elapsed in records:
+            if stage=='CACHE_RESULT':
+                print(f'Desktop cache result: mode={state}; status={scope}; reason={elapsed}.',flush=True)
+                continue
             print(f"Desktop checkpoint: {stage} {state}.", flush=True)
             if scope is not None and state != "start":
                 print(f"Desktop timing: {stage} {scope} {elapsed} ms.", flush=True)

@@ -25,6 +25,7 @@ import sys
 import tempfile
 import time
 import uuid
+from urllib.parse import urlparse
 
 
 def require(value, code):
@@ -109,6 +110,61 @@ http.createServer((req,res)=>{
 API_ENTRYPOINT = ['/app/docker/entrypoint.sh']
 API_COMMAND = ['node', 'apps/api/dist/server.mjs']
 API_REFERENCE = re.compile(r'docker\.cnb\.cool/shukezhinao/edu-agent-cloud-build/api@(sha256:[0-9a-f]{64})')
+ADMISSION_RUNTIME_PROBE = r"""
+const fs=require('fs'),crypto=require('crypto'),root='/app/apps/api/dist';
+const flag=process.env.DEPLOYMENT_ADMISSION_ENABLED;
+if(flag!==undefined&&flag!=='true'&&flag!=='false')throw Error('ADMISSION_FLAG_INVALID');
+const result={flag:flag??null,manifest:null,entrySha256:null,controlSha256:null};
+let stat;
+try{stat=fs.lstatSync(root+'/deployment-admission-runtime.json')}catch(error){if(error.code!=='ENOENT')throw error}
+if(stat){
+ if(!stat.isFile()||stat.isSymbolicLink()||stat.size>65536)throw Error('ADMISSION_MARKER_INVALID');
+ result.manifest=JSON.parse(fs.readFileSync(root+'/deployment-admission-runtime.json','utf8'));
+ for(const [key,name]of [['entrySha256','server.mjs'],['controlSha256','deployment-admission-control.mjs']]){
+  const file=root+'/'+name,info=fs.lstatSync(file);
+  if(!info.isFile()||info.isSymbolicLink())throw Error('ADMISSION_FILE_INVALID');
+  result[key]=crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+ }
+}
+console.log(JSON.stringify(result));
+"""
+
+
+def image_admission_flag(image):
+    rows=image.get('Config',{}).get('Env',[])
+    require(isinstance(rows,list) and all(isinstance(row,str) for row in rows),'API_ADMISSION_FLAG_INVALID')
+    flags=[row.split('=',1)[1] for row in rows if row.startswith('DEPLOYMENT_ADMISSION_ENABLED=')]
+    require(not flags or len(flags)==1 and flags[0] in ('true','false'),'API_ADMISSION_FLAG_INVALID')
+    return flags[0] if flags else None
+
+
+def validate_admission_runtime(value, flag):
+    require(isinstance(value,dict) and set(value)=={'flag','manifest','entrySha256','controlSha256'} and
+            value['flag']==flag,'API_ADMISSION_RUNTIME_INVALID')
+    manifest=value['manifest']
+    if manifest is None:
+        require(flag!='true' and value['entrySha256'] is None and value['controlSha256'] is None,
+                'API_ADMISSION_MARKER_REQUIRED')
+        return False
+    require(isinstance(manifest,dict) and set(manifest)=={'protocolVersion','role','entrySha256','controlSha256'} and
+            type(manifest['protocolVersion']) is int and manifest['protocolVersion']==2 and manifest['role']=='api',
+            'API_ADMISSION_MARKER_INVALID')
+    for key in ('entrySha256','controlSha256'):
+        require(isinstance(manifest[key],str) and re.fullmatch(r'[0-9a-f]{64}',manifest[key]) and
+                value[key]==manifest[key],'API_ADMISSION_BUNDLE_MISMATCH')
+    return True
+
+
+# Synthetic accounts must obey the candidate's real authentication contract.
+# Legacy clients omit this field; newer clients require an approved fixture.
+SYNTHETIC_CLASSROOM_SEED = r"""
+const fields=r('@prisma/client').Prisma.dmmf.datamodel.models.find(x=>x.name==='User').fields;
+const data={id:'teacher',email:'teacher@example.invalid',role:'ADMIN'};
+if(fields.some(x=>x.name==='registrationStatus'))data.registrationStatus='APPROVED';
+await p.user.create({data});
+const c=await p.classroom.create({data:{userId:'teacher',name:'synthetic shutdown class',subject:'数学'}});
+console.log(JSON.stringify(c.id));
+"""
 
 
 class Harness:
@@ -183,6 +239,34 @@ class Harness:
     def db(self, source):
         prefix="const r=require('module').createRequire('/app/apps/api/package.json');const{PrismaClient}=r('@prisma/client');const p=new PrismaClient();"
         return json.loads(self.node(prefix+"(async()=>{"+source+"})().finally(()=>p.$disconnect()).catch(e=>{console.error(e.code||e.name);process.exitCode=1})"))
+
+    def prepare_admission(self):
+        flag=image_admission_flag(self.images['api'])
+        validated=validate_admission_runtime(json.loads(self.node(ADMISSION_RUNTIME_PROBE)),flag)
+        result=dict(protocolVersion=2 if validated else 1,enabled=flag=='true',isolatedGateSeeded=False)
+        if flag!='true':return result
+        # This path may create exactly one synthetic row, never upsert/reset an
+        # existing gate. Check both the host-generated isolation scope and the
+        # database's own name before issuing any write.
+        url=urlparse(self.env['DATABASE_URL'])
+        config=json.loads(self.compose.read_text())
+        postgres=config.get('services',{}).get('postgres',{})
+        require(re.fullmatch(r'api-shutdown-[0-9a-f]{16}',self.project) and config.get('name')==self.project and
+                self.env.get('DATABASE_HOST')=='postgres' and url.scheme=='postgresql' and url.hostname=='postgres' and
+                url.port==5432 and url.path=='/shutdown_acceptance' and url.query=='schema=public' and not url.fragment and
+                postgres.get('environment',{}).get('POSTGRES_DB')=='shutdown_acceptance' and
+                postgres.get('image')==self.images['postgres']['Id'] and not postgres.get('volumes') and
+                all(network.get('internal') and not network.get('external') for network in config.get('networks',{}).values()) and
+                config.get('networks') and all(not service.get('ports') and not service.get('extra_hosts') and
+                    not service.get('network_mode') for service in config.get('services',{}).values()),
+                'ISOLATED_ADMISSION_DATABASE_REQUIRED')
+        seeded=self.db("const names=await p.$queryRawUnsafe('SELECT current_database() AS name');"
+            "if(names.length!==1||names[0].name!=='shutdown_acceptance')throw Error('ISOLATED_ADMISSION_DATABASE_REQUIRED');"
+            "const gate=await p.deploymentGate.create({data:{id:'production',state:'accepting',generation:0n}});"
+            "console.log(JSON.stringify({id:gate.id,state:gate.state,generation:String(gate.generation)}));")
+        require(seeded==dict(id='production',state='accepting',generation='0'),'ISOLATED_ADMISSION_SEED_FAILED')
+        result['isolatedGateSeeded']=True
+        return result
 
     def request(self, url, body=None, method='GET'):
         pre="const jwt=require('module').createRequire('/app/apps/api/package.json')('jsonwebtoken');const token=jwt.sign({sub:'teacher',email:'teacher@example.invalid',passwordVersion:0},process.env.JWT_SECRET,{expiresIn:'10m'});"
@@ -418,8 +502,9 @@ def main():
         started=True
         app.command(app.argv()+['up','-d','--no-build','--pull','never','--wait','--wait-timeout','90','postgres','redis','client','upstream'],timeout=120)
         require(app.db("const r=await p.$queryRawUnsafe(\"SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema='public'\");console.log(r[0].n);")==0,'FRESH_DATABASE_REQUIRED')
-        app.node("require('child_process').execFileSync('pnpm',['exec','prisma','db','push','--skip-generate'],{stdio:'inherit'})",timeout=120)
-        classroom=app.db("await p.user.create({data:{id:'teacher',email:'teacher@example.invalid',role:'ADMIN'}});const c=await p.classroom.create({data:{userId:'teacher',name:'synthetic shutdown class',subject:'数学'}});console.log(JSON.stringify(c.id));")
+        app.node("require('child_process').execFileSync(process.execPath,['/app/node_modules/prisma/build/index.js','db','push','--skip-generate'],{stdio:'inherit'})",timeout=120)
+        report['admissionRuntime']=app.prepare_admission()
+        classroom=app.db(SYNTHETIC_CLASSROOM_SEED)
         version=json.loads(app.node("console.log(JSON.stringify(require('/app/package.json').version))"))
         require(version==args.version,'API_PACKAGE_VERSION_MISMATCH')
         app.command(app.argv()+['up','-d','--no-build','--pull','never','--wait','--wait-timeout','120','api'],timeout=150)

@@ -57,6 +57,15 @@ class ActivationTests(unittest.TestCase):
             self.assertEqual(value['services']['api']['environment']['AGENT_ROLLOUT_USER_IDS'], ','.join(ids))
             self.assertEqual(value['services']['codex-agent-runtime'], runtime.extension(IMAGE, IDENTITY, config)['services']['codex-agent-runtime'])
 
+    def test_candidate_refuses_a_policy_without_exact_runner_log_rotation(self):
+        receiver=self.receiver
+        receiver.ops=types.SimpleNamespace(codex_module=lambda:runtime,codex_context=lambda:None)
+        legacy=runtime.extension(IMAGE,IDENTITY,configuration())
+        legacy['services']['codex-agent-runtime'].pop('logging')
+        with patch.object(runtime,'load_settings',return_value=configuration()),patch.object(runtime,'extension',return_value=legacy):
+            with self.assertRaisesRegex(receiver.Refused,'CODEX_RUNTIME_LOGGING_NOT_INSTALLED'):
+                receiver.candidate_override({},package(),Path('/synthetic/web'))
+
     def test_incomplete_host_support_refuses_before_candidate_write_or_commands(self):
         receiver = self.receiver
         for ops in (types.SimpleNamespace(), types.SimpleNamespace(codex_module=lambda: runtime),
@@ -330,7 +339,8 @@ class ActivationTests(unittest.TestCase):
                     if fail=='stop-uncertain':raise ValueError('API_DRAIN_STOP_UNCERTAIN')
                     on_stopped();receiver.stop_api_for_release(self.api)
             stack.enter_context(patch.object(receiver,'api_drain_module',return_value=types.SimpleNamespace(Fence=FakeFence,DrainError=ValueError)))
-            stack.enter_context(patch.object(receiver.shutil,'disk_usage',return_value=types.SimpleNamespace(free=10**12)))
+            stack.enter_context(patch.object(receiver,'require_release_disk',return_value={'status':'build_ready'}))
+            stack.enter_context(patch.object(receiver,'admission_scope',return_value=contextlib.nullcontext(None)))
             stack.enter_context(patch.object(receiver.time,'monotonic',side_effect=[0,181]))
             if fail in('candidate','shutdown-acceptance'):
                 with self.assertRaisesRegex(receiver.Refused,'CANDIDATE_REFUSED'if fail=='candidate'else'API_SHUTDOWN_ACCEPTANCE_FAILED'):

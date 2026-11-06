@@ -128,7 +128,7 @@ console.log(JSON.stringify({status:db.status,error:db.errorMessage,result:db.res
         try:
             app.command(app.compose_argv()+['up','-d','--no-build','--pull','never','--wait','--wait-timeout','60','postgres','redis','web','model'],timeout=90)
             require(app.db("const r=await p.$queryRawUnsafe(\"SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema='public'\");console.log(r[0].n)",'web')==0,'FRESH_DATABASE_REQUIRED')
-            app.node("require('child_process').execFileSync('pnpm',['exec','prisma','db','push','--skip-generate'],{stdio:'inherit'})",'web',timeout=120)
+            app.node("require('child_process').execFileSync(process.execPath,['/app/node_modules/prisma/build/index.js','db','push','--skip-generate'],{stdio:'inherit'})",'web',timeout=120)
             app.db("await p.user.create({data:{id:'teacher',email:'synthetic-lesson@example.invalid'}});console.log('true')",'web')
             current_job=job=seed();report['initialJob']=job;start();first=wait(lambda:partial(job),'SECOND_LESSON_CHECKPOINT_NOT_SAVED')
             assert_child(first['children'][0]);require(model()['plans']==4 and all(sum(x['type']==kind for x in model()['requests'])==2 for kind in ('plan','blueprint')) and not model()['unknown'],'UNEXPECTED_INITIAL_REQUESTS')

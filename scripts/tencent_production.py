@@ -250,11 +250,16 @@ RECEIVER_FAILURE_CODES = frozenset({
     "API_SHUTDOWN_ACCEPTANCE_FAILED", "API_SHUTDOWN_ACCEPTANCE_MISMATCH",
     "API_SHUTDOWN_ACCEPTANCE_INCOMPLETE", "API_SHUTDOWN_ACCEPTANCE_PATH_UNSAFE",
     "API_SHUTDOWN_IMAGE_REFERENCE_REQUIRED", "API_SHUTDOWN_ACCEPTANCE_PRODUCTION_CHANGED",
+    "CAPACITY_DOCKER_ROOT_INVALID", "CAPACITY_FILESYSTEM_INVALID",
+    "RELEASE_ADMISSION_RECOVERY_REQUIRED", "RELEASE_ADMISSION_CONTROL_FAILED", "RELEASE_ADMISSION_CAPABILITY_INVALID",
+    "RELEASE_ADMISSION_OWNER_INVALID", "RELEASE_ADMISSION_OWNER_CHANGED", "RELEASE_ADMISSION_NOT_QUIESCENT",
+    "RELEASE_ADMISSION_RELEASE_UNCONFIRMED",
 })
 RECEIVER_FAILURE_PHASES = frozenset({
     "protocol", "stage-registry-pull", "stage-relay-download", "stage-validate", "stage-load-images",
     "validate-artifacts", "maintenance", "migration", "activate", "verify", "rollback",
     "candidate-preflight", "build-preflight", "api-shutdown-acceptance", "drain", "worker-stop", "release-status",
+    "gate-quiesce", "gate-await", "gate-critical", "gate-release", "worker-drain",
     "receive", "registry-pull", "relay-download", "load-images",
 })
 RECEIVER_CAUSE_CODES = RECEIVER_FAILURE_CODES | frozenset({
@@ -284,6 +289,28 @@ def receiver_cause(output):
         return None
     cause = json.loads(output).get("causeCode")
     return cause if isinstance(cause, str) and cause in RECEIVER_CAUSE_CODES else None
+
+
+def report_timing_summary(value):
+    """Reconstruct only bounded numeric metrics; never print receiver strings."""
+    names = frozenset(('release-preflight','registry-pull','receive','relay-download','validate-artifacts',
+        'load-images','candidate-preflight','api-shutdown-acceptance','drain','worker-drain','worker-stop',
+        'migration','activate','verify','rollback','stage-registry-pull','stage-relay-download','stage-validate',
+        'stage-load-images','gate-quiesce','gate-await','gate-critical','gate-release'))
+    if (not isinstance(value, dict) or set(value) != {'schemaVersion','phases','totalDurationMs','maintenanceDurationMs'} or
+            type(value['schemaVersion']) is not int or value['schemaVersion'] != 1 or
+            not isinstance(value['phases'],list) or len(value['phases']) > 64):
+        return
+    for key in ('totalDurationMs','maintenanceDurationMs'):
+        if type(value[key]) is not int or not 0 <= value[key] <= 10800000:return
+    rows = value['phases']
+    if any(not isinstance(row,dict) or set(row) != {'name','durationMs'} or not isinstance(row['name'],str) or row['name'] not in names or
+           type(row['durationMs']) is not int or not 0 <= row['durationMs'] <= 10800000 for row in rows):
+        return
+    for row in rows:
+        status('Tencent Production timing: phase=' + row['name'] + '; milliseconds=' + str(row['durationMs']) + '.')
+    status('Tencent Production timing: total_ms=' + str(value['totalDurationMs']) +
+           '; maintenance_observed_ms=' + str(value['maintenanceDurationMs']) + '.')
 
 
 def read_with_open_input(process, timeout=5400):
@@ -336,6 +363,7 @@ def remote(ssh, child, log, request, payload=None):
             if process.returncode:
                 failure = receiver_failure(output) if len(output) <= 128 * 1024 else None
                 if failure:
+                    report_timing_summary(json.loads(output).get('timingSummary'))
                     if request.get("action") == "release-status" and failure == ("ACTION_REFUSED", "protocol"):
                         raise UnsupportedReleaseStatus(44)
                     cause = receiver_cause(output)
@@ -777,6 +805,7 @@ def execute(env):
                                    for kind in ("api", "worker", "web")):
                                 status("Tencent Production: " + category + " " + ", ".join(
                                     kind + "=" + str(round(values[kind], 1)) for kind in ("api", "worker", "web")))
+                    report_timing_summary(result.get('timingSummary'))
                     deployed = True
                     try:
                         github_request(env["PUBLIC_GH_TOKEN"], "POST", f"/repos/{PUBLIC}/deployments/{deployment_id}/statuses", {

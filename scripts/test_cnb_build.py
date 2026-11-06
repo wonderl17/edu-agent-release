@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -27,7 +29,9 @@ time.sleep(float(delay))
 if outcome == 'fail': sys.exit(7)
 value = {'containerimage.digest': 'sha256:' + 'e'*64, 'containerimage.config.digest': 'sha256:' + 'f'*64}
 if outcome == 'invalid': value['containerimage.digest'] = 'not-a-digest'
-if outcome == 'missing-config': del value['containerimage.config.digest']
+if outcome == 'missing-config':
+    del value['containerimage.config.digest']
+    value['containerimage.digest'] = os.environ['FAKE_MANIFEST_DIGEST']
 if outcome == 'invalid-config': value['containerimage.config.digest'] = 'not-a-digest'
 pathlib.Path(metadata).write_text(json.dumps(value))
 event('end')
@@ -77,28 +81,6 @@ class BuildTests(unittest.TestCase):
             self.assertEqual([(e['kind'], e['action']) for e in self.events(root)],
                              [(kind, action) for kind in ('api', 'worker', 'web') for action in ('start', 'end')])
             self.assertTrue(all(v['id'] == 'sha256:'+'f'*64 for v in images.values()))
-
-    def test_missing_config_digest_resolves_actual_id_from_immutable_image(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            ref = builder.REGISTRY + '/api@sha256:' + 'e'*64
-            with patch.object(builder, 'run', side_effect=[b'pulled', ('sha256:'+'a'*64+'\n').encode()]) as run:
-                images, _ = builder.build_images(self.jobs(root, (0, 0, 0), 'missing-config'), root, os.environ, root)
-            self.assertEqual(images['api'], {'ref': ref, 'id': 'sha256:'+'a'*64})
-            self.assertEqual(run.call_args_list[0].args, (['docker', 'pull', ref],))
-            self.assertEqual(run.call_args_list[1].args, (['docker', 'image', 'inspect', '--format', '{{.Id}}', ref],))
-            self.assertTrue(all(call.kwargs == {'env': os.environ} for call in run.call_args_list))
-
-    def test_config_resolution_failure_stops_sibling_and_queued_builds(self):
-        for responses in ([subprocess.CalledProcessError(1, ['docker', 'pull'])], [b'pulled', b'invalid-id']):
-            with self.subTest(responses=responses), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                with patch.object(builder, 'run', side_effect=responses):
-                    with self.assertRaises((subprocess.CalledProcessError, ValueError)):
-                        builder.build_images(self.jobs(root, (0.2, 30, 0), 'missing-config'), root, os.environ, root)
-                events = self.events(root)
-                self.assertNotIn('web', [e['kind'] for e in events])
-                self.assert_stopped(events)
 
     def test_present_config_digest_never_uses_fallback(self):
         for outcome in ('ok', 'invalid-config'):
@@ -172,6 +154,131 @@ b.build_images([(k,c,pathlib.Path(m)) for k,c,m in jobs],r,os.environ,r)
                 builder.build_images(jobs, root, os.environ, root)
             self.assertEqual({e['kind'] for e in self.events(root)}, {'api', 'worker', 'web', 'codex-runtime'})
             self.assert_stopped(self.events(root))
+
+    def test_completed_export_missing_config_resolves_verified_image(self):
+        fixture = MetadataTests().fixture()
+        manifest, config, digest, config_digest = fixture
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = dict(os.environ, FAKE_MANIFEST_DIGEST=digest)
+            with patch.object(builder, 'run', return_value=manifest), patch.object(builder, 'registry_config_bytes', return_value=config):
+                images, _ = builder.build_images(self.jobs(root, (0, 0, 0), 'missing-config'), root, env, root,
+                    identity=dict(sourceSha='a'*40, version='0.0.138'))
+            self.assertEqual(images['api'], dict(ref=builder.REGISTRY+'/api@'+digest, id=config_digest))
+
+    def test_missing_config_reconciliation_failure_stops_sibling_and_queued_work(self):
+        for response in (b'corrupted', subprocess.CalledProcessError(1,['docker','buildx','imagetools','inspect'])):
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)
+                env=dict(os.environ,FAKE_MANIFEST_DIGEST='sha256:'+'e'*64)
+                mock={'side_effect':response} if isinstance(response,Exception) else {'return_value':response}
+                with patch.object(builder,'run',**mock),self.assertRaises((ValueError,subprocess.CalledProcessError)):
+                    builder.build_images(self.jobs(root,(0.2,30,0),'missing-config'),root,env,root)
+                self.assertNotIn('web',[e['kind'] for e in self.events(root)])
+                self.assert_stopped(self.events(root))
+
+
+class MetadataTests(unittest.TestCase):
+    def fixture(self, *, docker=False, platform=None, labels=None):
+        content = dict(os='linux', architecture='amd64', config=dict(Labels=labels or {
+            'org.opencontainers.image.revision':'a'*40, 'org.opencontainers.image.version':'0.0.138'}))
+        content.update(platform or {})
+        config = json.dumps(content, sort_keys=True, separators=(',', ':')).encode()
+        config_digest = 'sha256:'+hashlib.sha256(config).hexdigest()
+        manifest = json.dumps(dict(schemaVersion=2,
+            mediaType='application/vnd.docker.distribution.manifest.v2+json' if docker else 'application/vnd.oci.image.manifest.v1+json',
+            config=dict(mediaType='application/vnd.docker.container.image.v1+json' if docker else 'application/vnd.oci.image.config.v1+json',
+                        digest=config_digest, size=len(config)), layers=[]), sort_keys=True, separators=(',', ':')).encode()
+        return manifest, config, 'sha256:'+hashlib.sha256(manifest).hexdigest(), config_digest
+
+    def metadata(self, manifest, digest, config_digest=None):
+        value = {'containerimage.digest':digest, 'containerimage.descriptor':dict(
+            mediaType=json.loads(manifest)['mediaType'], digest=digest,
+            annotations={'config.digest':config_digest} if config_digest else {}),
+            'buildx.build.provenance':{}, 'cache.manifest.digest':'sha256:'+'c'*64}
+        return value
+
+    def resolve(self, fixture, metadata=None, identity=True):
+        manifest, config, digest, config_digest = fixture
+        value = metadata if metadata is not None else self.metadata(manifest, digest, config_digest)
+        with patch.object(builder, 'run', return_value=manifest) as run, patch.object(builder, 'registry_config_bytes', return_value=config) as read:
+            result = builder.image_identity_from_metadata(value, 'worker', {},
+                dict(sourceSha='a'*40, version='0.0.138') if identity else None)
+        if result:
+            run.assert_called_once_with(['docker','buildx','imagetools','inspect','--raw',builder.REGISTRY+'/worker@'+digest], env={}, timeout=60)
+            read.assert_called_once_with('worker', config_digest, {})
+        return result
+
+    def test_completed_image_and_cache_exports_use_exact_image_manifest_and_config_bytes(self):
+        for docker in (False, True):
+            with self.subTest(docker=docker):
+                fixture = self.fixture(docker=docker)
+                self.assertEqual(self.resolve(fixture), fixture[2:])
+                # Real failing exporter may omit the whole optional descriptor.
+                self.assertEqual(self.resolve(fixture, {'containerimage.digest':fixture[2],
+                    'cache.manifest.digest':'sha256:'+'c'*64}), fixture[2:])
+
+    def test_old_explicit_config_digest_preserves_existing_protocol_and_rejects_conflict(self):
+        fixture = self.fixture(); manifest, _, digest, config_digest = fixture
+        value = self.metadata(manifest, digest, config_digest)
+        value['containerimage.config.digest'] = config_digest
+        with patch.object(builder, 'run') as run, patch.object(builder, 'registry_config_bytes') as read:
+            self.assertEqual(builder.image_identity_from_metadata(value,'api',{}), (digest, config_digest))
+            run.assert_not_called(); read.assert_not_called()
+        for bad in (None, '', 'unknown', True):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                builder.image_identity_from_metadata(dict(value, **{'containerimage.config.digest':bad}),'api',{})
+        value['containerimage.config.digest'] = 'sha256:'+'b'*64
+        with self.assertRaisesRegex(ValueError, 'conflict'):
+            builder.image_identity_from_metadata(value,'api',{})
+
+    def test_wrong_platform_source_and_raw_content_are_rejected(self):
+        for kwargs in (dict(platform=dict(architecture='arm64')), dict(platform=dict(os='windows')),
+                       dict(labels={'org.opencontainers.image.revision':'b'*40,'org.opencontainers.image.version':'0.0.138'})):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError): self.resolve(self.fixture(**kwargs))
+        fixture = self.fixture(); manifest, config, digest, config_digest = fixture
+        for bad in ((manifest+b' ', config, digest, config_digest), (manifest, config+b' ', digest, config_digest)):
+            with self.assertRaises(ValueError): self.resolve(bad)
+
+    def test_cache_index_unknown_media_and_descriptor_conflict_are_rejected(self):
+        fixture = self.fixture(); manifest, config, digest, config_digest = fixture
+        value = self.metadata(manifest, digest, config_digest)
+        for media in ('application/vnd.oci.image.index.v1+json', 'application/vnd.buildkit.cacheconfig.v0', 'unknown'):
+            bad = json.loads(manifest); bad['mediaType'] = media
+            raw = json.dumps(bad).encode(); new_digest='sha256:'+hashlib.sha256(raw).hexdigest()
+            with self.subTest(media=media), self.assertRaises(ValueError):
+                self.resolve((raw, config, new_digest, config_digest), {'containerimage.digest':new_digest})
+        for field, bad in (('digest','sha256:'+'b'*64), ('mediaType','unknown')):
+            value = self.metadata(manifest,digest,config_digest); value['containerimage.descriptor'][field]=bad
+            with self.assertRaises(ValueError): self.resolve(fixture,value)
+        value = self.metadata(manifest,digest,'sha256:'+'b'*64)
+        with self.assertRaises(ValueError): self.resolve(fixture,value)
+        bad = json.loads(manifest); bad['config']['mediaType']='application/vnd.buildkit.cacheconfig.v0'
+        raw=json.dumps(bad).encode(); new_digest='sha256:'+hashlib.sha256(raw).hexdigest()
+        with self.assertRaises(ValueError): self.resolve((raw,config,new_digest,config_digest))
+
+    def test_config_registry_auth_is_scoped_read_only_and_never_in_url(self):
+        class Response:
+            def __init__(self,data): self.data=data
+            def __enter__(self): return self
+            def __exit__(self,*args): pass
+            def read(self,limit): return self.data[:limit]
+        requests=[]
+        class Opener:
+            def open(self,request,**kwargs):
+                requests.append(request)
+                return Response(b'{"token":"private-token"}' if len(requests)==1 else b'config')
+        with tempfile.TemporaryDirectory() as directory:
+            auth=base64.b64encode(b'username:private-password').decode()
+            Path(directory,'config.json').write_text(json.dumps(dict(auths={'docker.cnb.cool':dict(auth=auth)})))
+            with patch.object(builder,'build_opener',return_value=Opener()) as opener:
+                self.assertEqual(builder.registry_config_bytes('worker','sha256:'+'a'*64,dict(DOCKER_CONFIG=directory)),b'config')
+            self.assertIsInstance(opener.call_args.args[0],builder.NoRegistryRedirect)
+            self.assertIn('scope=repository%3A'+builder.REPO.replace('/','%2F')+'%2Fworker%3Apull',requests[0].full_url)
+            self.assertEqual(requests[0].get_header('Authorization'),'Basic '+auth)
+            self.assertEqual(requests[1].get_header('Authorization'),'Bearer private-token')
+            self.assertTrue(all(r.full_url.startswith('https://docker.cnb.cool/') and 'private' not in r.full_url for r in requests))
+            with self.assertRaises(ValueError): builder.registry_config_bytes('../worker','sha256:'+'a'*64,{})
 
 
 class CodexCacheTests(unittest.TestCase):

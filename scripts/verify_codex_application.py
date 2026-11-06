@@ -278,7 +278,7 @@ def main():
                                           'postgres', 'redis', 'worker-general', 'worker-ppt', 'web', 'gateway', 'storage'], timeout=90)
             count = app.db("const r=await p.$queryRawUnsafe(\"SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema='public'\");console.log(JSON.stringify(r[0].count));", 'web')
             require(count == 0, 'FRESH_DATABASE_REQUIRED')
-            app.node("require('child_process').execFileSync('pnpm',['exec','prisma','db','push','--skip-generate'],{stdio:'inherit'});", 'web', timeout=120)
+            app.node("require('child_process').execFileSync(process.execPath,['/app/node_modules/prisma/build/index.js','db','push','--skip-generate'],{stdio:'inherit'});", 'web', timeout=120)
             app.db("await p.user.createMany({data:['teacher','other','admin'].map(id=>({id,email:id+'@example.invalid',role:id==='admin'?'ADMIN':'USER'}))});console.log('true');", 'web')
             app.command(app.compose_argv()+['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '120'], timeout=160)
             require(app.snapshot()['healthy'], 'INITIAL_HEALTH_FAILED')
