@@ -27,6 +27,8 @@ time.sleep(float(delay))
 if outcome == 'fail': sys.exit(7)
 value = {'containerimage.digest': 'sha256:' + 'e'*64, 'containerimage.config.digest': 'sha256:' + 'f'*64}
 if outcome == 'invalid': value['containerimage.digest'] = 'not-a-digest'
+if outcome == 'missing-config': del value['containerimage.config.digest']
+if outcome == 'invalid-config': value['containerimage.config.digest'] = 'not-a-digest'
 pathlib.Path(metadata).write_text(json.dumps(value))
 event('end')
 '''
@@ -75,6 +77,41 @@ class BuildTests(unittest.TestCase):
             self.assertEqual([(e['kind'], e['action']) for e in self.events(root)],
                              [(kind, action) for kind in ('api', 'worker', 'web') for action in ('start', 'end')])
             self.assertTrue(all(v['id'] == 'sha256:'+'f'*64 for v in images.values()))
+
+    def test_missing_config_digest_resolves_actual_id_from_immutable_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ref = builder.REGISTRY + '/api@sha256:' + 'e'*64
+            with patch.object(builder, 'run', side_effect=[b'pulled', ('sha256:'+'a'*64+'\n').encode()]) as run:
+                images, _ = builder.build_images(self.jobs(root, (0, 0, 0), 'missing-config'), root, os.environ, root)
+            self.assertEqual(images['api'], {'ref': ref, 'id': 'sha256:'+'a'*64})
+            self.assertEqual(run.call_args_list[0].args, (['docker', 'pull', ref],))
+            self.assertEqual(run.call_args_list[1].args, (['docker', 'image', 'inspect', '--format', '{{.Id}}', ref],))
+            self.assertTrue(all(call.kwargs == {'env': os.environ} for call in run.call_args_list))
+
+    def test_config_resolution_failure_stops_sibling_and_queued_builds(self):
+        for responses in ([subprocess.CalledProcessError(1, ['docker', 'pull'])], [b'pulled', b'invalid-id']):
+            with self.subTest(responses=responses), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with patch.object(builder, 'run', side_effect=responses):
+                    with self.assertRaises((subprocess.CalledProcessError, ValueError)):
+                        builder.build_images(self.jobs(root, (0.2, 30, 0), 'missing-config'), root, os.environ, root)
+                events = self.events(root)
+                self.assertNotIn('web', [e['kind'] for e in events])
+                self.assert_stopped(events)
+
+    def test_present_config_digest_never_uses_fallback(self):
+        for outcome in ('ok', 'invalid-config'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with patch.object(builder, 'run') as run:
+                    if outcome == 'ok':
+                        builder.build_images(self.jobs(root, (0, 0, 0)), root, os.environ, root)
+                    else:
+                        with self.assertRaises(ValueError):
+                            builder.build_images(self.jobs(root, (0.2, 30, 0), outcome), root, os.environ, root)
+                        self.assert_stopped(self.events(root))
+                    run.assert_not_called()
 
     def test_failed_build_or_bad_digest_stops_sibling_and_never_starts_queued_work(self):
         for outcome in ('fail', 'invalid'):

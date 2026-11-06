@@ -69,10 +69,21 @@ def build_images(jobs, source, docker_env, directory, concurrency=2, timeout=540
                 if result:
                     raise subprocess.CalledProcessError(result, process.args)
                 value = json.loads(metadata.read_text())
-                digest, config = value["containerimage.digest"], value["containerimage.config.digest"]
-                if not DIGEST.fullmatch(digest) or not DIGEST.fullmatch(config):
+                digest = value.get("containerimage.digest")
+                if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
                     raise ValueError("build digest")
-                images[kind] = {"ref": REGISTRY + "/" + kind + "@" + digest, "id": config}
+                ref = REGISTRY + "/" + kind + "@" + digest
+                if "containerimage.config.digest" in value:
+                    config = value["containerimage.config.digest"]
+                else:
+                    # BuildKit may omit the config digest from exporter metadata.
+                    # Resolve the real image ID using the immutable pushed digest.
+                    run(["docker", "pull", ref], env=docker_env)
+                    config = run(["docker", "image", "inspect", "--format", "{{.Id}}", ref],
+                                 env=docker_env).decode().strip()
+                if not isinstance(config, str) or not DIGEST.fullmatch(config):
+                    raise ValueError("build digest")
+                images[kind] = {"ref": ref, "id": config}
                 timings[kind] = round(time.monotonic() - start, 3)
                 log.close()
                 del active[kind]
