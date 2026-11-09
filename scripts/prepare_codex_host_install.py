@@ -10,6 +10,18 @@ import tempfile
 REPO=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('installer_contract',REPO/'server/codex_host_install.py')
 contract=importlib.util.module_from_spec(spec);spec.loader.exec_module(contract)
+OLD_IDENTITY = b"identity = dict(schemaVersion=1, protocol=labels.get('io.shukezhinao.codex.protocol'), sdkVersion=labels.get('io.shukezhinao.codex.sdk-version'))"
+NEW_IDENTITY = b"identity = codex_module().runtime_identity_from_labels(labels)"
+
+
+def prepare_startup(path, patch):
+    source = path.read_bytes()
+    # A host with the earlier runner already installed needs an exact upgrade
+    # of the identity reader. The audited bytes are still bound by the bundle.
+    if source.count(OLD_IDENTITY) == 1 and NEW_IDENTITY not in source:
+        path.write_bytes(source.replace(OLD_IDENTITY, NEW_IDENTITY, 1))
+    elif source.count(NEW_IDENTITY) != 1 or OLD_IDENTITY in source:
+        subprocess.run(['patch','--batch','--fuzz=0',str(path)],input=patch,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True)
 
 
 def prepare(audit_dir,output):
@@ -29,7 +41,7 @@ def prepare(audit_dir,output):
     patch=(REPO/'server/production-ops-codex.patch').read_bytes()
     with tempfile.TemporaryDirectory(prefix='codex-host-bundle-')as directory:
         source=Path(directory)/'production-ops.py';source.write_bytes((audit_dir/'production-ops.py').read_bytes())
-        subprocess.run(['patch','--batch','--fuzz=0',str(source)],input=patch,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True)
+        prepare_startup(source,patch)
         payload={contract.STARTUP:source.read_bytes(),contract.RECEIVER:(REPO/'server/tencent_receiver.py').read_bytes(),
                  'operations/release/cnb_release.py':(REPO/'scripts/cnb_release.py').read_bytes(),
                  'operations/release/tencent_registry.py':(REPO/'scripts/tencent_registry.py').read_bytes(),

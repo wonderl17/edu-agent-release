@@ -16,7 +16,7 @@ from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from cnb_release import (REPO, REGISTRY, SOURCE, SHA, DIGEST, canonical, validate_manifest,
-                         RUNTIME_KIND, RUNTIME_ROOT, RUNTIME_LABELS, filesystem_runtime, inspect_runtime_image)
+                         RUNTIME_KIND, RUNTIME_ROOT, runtime_labels, filesystem_runtime, inspect_runtime_image)
 
 CODEX_CACHE_KIND = "codex-runtime"
 IMAGE_MANIFEST_TYPES = frozenset(("application/vnd.oci.image.manifest.v1+json",
@@ -263,8 +263,8 @@ def image_jobs(sha, version, request_id, directory, cache_tag, runtime):
             command += ["--build-arg", "VITE_API_BASE_URL=/api", "--build-arg",
                         "VITE_DEPLOY_ENV=shukezhinao-prod", "--build-arg", "VITE_BUILD_SHA=" + sha]
         if kind == RUNTIME_KIND:
-            for key, label in RUNTIME_LABELS.items():
-                command += ["--label", label + "=" + runtime[key]]
+            for label, value in runtime_labels(runtime).items():
+                command += ["--label", label + "=" + value]
         jobs.append((kind, command + [context], metadata))
     return jobs
 

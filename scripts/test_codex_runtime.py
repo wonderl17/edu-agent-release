@@ -15,6 +15,18 @@ def configuration():
 
 
 class RuntimePolicyTests(unittest.TestCase):
+    def test_labels_preserve_old_runtime_identity_and_reject_mixed_generations(self):
+        prefix = 'io.shukezhinao.codex.'
+        protocol = {prefix+'protocol': IDENTITY['protocol']}
+        old = {prefix+'sdk-version': IDENTITY['sdkVersion']}
+        native = {prefix+'engine': 'responses', prefix+'runtime-version': '0.2.0'}
+        self.assertEqual(runtime.runtime_identity_from_labels({**protocol, **old}), IDENTITY)
+        identity = runtime.runtime_identity_from_labels({**protocol, **native})
+        self.assertEqual(identity, dict(schemaVersion=2, protocol=IDENTITY['protocol'],
+                                        engine='responses', runtimeVersion='0.2.0'))
+        with self.assertRaisesRegex(ValueError, 'CODEX_RUNTIME_PROTOCOL'):
+            runtime.runtime_identity_from_labels({**protocol, **old, **native})
+
     def test_settings_require_distinct_capabilities_and_explicit_bounded_pilot(self):
         self.assertEqual(runtime.settings(configuration()), configuration())
         for change in (

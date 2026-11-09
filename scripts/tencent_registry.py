@@ -8,7 +8,7 @@ import tarfile
 import time
 import uuid
 
-from cnb_release import canonical, validate_manifest, RUNTIME_KIND, RUNTIME_LABELS, inspect_runtime_image
+from cnb_release import canonical, validate_manifest, RUNTIME_KIND, runtime_labels, inspect_runtime_image
 
 
 def validate(c, value, h):
@@ -84,7 +84,7 @@ def image_identity(c, item, image, h):
 
 def runtime_identity(c, runtime, item, image):
     config = image.get('Config', {})
-    c.require(all(config.get('Labels', {}).get(label) == runtime[key] for key, label in RUNTIME_LABELS.items()) and
+    c.require(all(config.get('Labels', {}).get(label) == value for label, value in runtime_labels(runtime).items()) and
               config.get('User') == 'node' and config.get('WorkingDir') == '/app' and
               config.get('Cmd') == ['node', 'server.mjs'] and not config.get('Entrypoint'),
               'REGISTRY_RUNTIME_CONFIG_MISMATCH')
