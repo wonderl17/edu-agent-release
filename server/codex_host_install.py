@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Root operator's bounded, recoverable initial Codex helper installation.
+"""Root operator's bounded, recoverable Codex helper installation.
 
 Run only from a reviewed root-owned host-install-bundles/<manifest hash>/install.py.
 No Docker mutations, database writes, model calls or remote installation action.
@@ -33,6 +33,7 @@ SETTINGS='environments/codex-runtime.json'
 PENDING='operations/release/state/codex-host-install.pending.json'
 RECEIPT='operations/release/state/codex-host-install.last.json'
 SERVICES={'api','worker-general','worker-ppt','web','gateway','postgres','redis','storage'}
+SERVICE_SETS=(SERVICES,SERVICES|{'codex-agent-runtime'})
 GATE=b'#!/usr/bin/python3\nimport json,sys\nprint(json.dumps({"status":"failed","code":"CODEX_HOST_INSTALLATION_RECOVERY_REQUIRED","modelCalls":0,"externalNotifications":0}))\nsys.exit(1)\n'
 
 
@@ -153,7 +154,7 @@ class Installer:
         self.read(STARTUP);ops=load(self.root/STARTUP);ops.preflight();sample=ops.snapshot();containers=ops.inspect()
         failures=set(sample.get('failures',[]))
         require((sample.get('healthy')is True or failures=={'CODEX_HOST_INSTALLATION_PENDING'})and
-                failures<= {'CODEX_HOST_INSTALLATION_PENDING'}and set(containers)==SERVICES,'HOST_INSTALL_RUNTIME_UNHEALTHY')
+                failures<= {'CODEX_HOST_INSTALLATION_PENDING'}and set(containers) in SERVICE_SETS,'HOST_INSTALL_RUNTIME_UNHEALTHY')
         return dict(configSha256=digest(canonical(ops.config())),containers={name:dict(id=c['Id'],image=c['Image'],startedAt=c['State']['StartedAt'])
                                                                        for name,c in containers.items()})
 
@@ -218,7 +219,7 @@ class Installer:
                 value=load(self.bundle/'files/codex_runtime.py').settings(decode(after))
                 require(value['rolloutMode']=='closed'and value['userIds']==[],'HOST_INSTALL_JOURNAL_SETTINGS')
         require(set(r['runtime'])=={'configSha256','containers'}and re.fullmatch('[0-9a-f]{64}',r['runtime']['configSha256'])and
-                set(r['runtime']['containers'])==SERVICES,'HOST_INSTALL_JOURNAL_RUNTIME')
+                set(r['runtime']['containers']) in SERVICE_SETS,'HOST_INSTALL_JOURNAL_RUNTIME')
         for item in r['runtime']['containers'].values():
             require(set(item)=={'id','image','startedAt'}and re.fullmatch('[0-9a-f]{64}',item['id'])and
                     re.fullmatch('sha256:[0-9a-f]{64}',item['image'])and isinstance(item['startedAt'],str),'HOST_INSTALL_JOURNAL_RUNTIME')
@@ -234,6 +235,7 @@ class Installer:
         for name,item in r['files'].items():require(self.read(name,True)==unpacked(item[side]),'HOST_INSTALL_FILE_NOT_RESTORED'if side=='before'else'HOST_INSTALL_FILE_NOT_INSTALLED')
         actual=self.runtime();previous=r['runtime']
         require(actual['configSha256']==previous['configSha256'],'HOST_INSTALL_APPLICATION_CONFIG_CHANGED')
+        require(set(actual['containers'])==set(previous['containers']),'HOST_INSTALL_APPLICATION_IDENTITY_CHANGED')
         restarted=[]
         for name,before in previous['containers'].items():
             after=actual['containers'][name]

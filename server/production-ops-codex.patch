@@ -108,7 +108,7 @@
 +    if 'codex-agent-runtime' in containers:
 +        try:
 +            labels = containers['codex-agent-runtime']['Config'].get('Labels', {})
-+            identity = dict(schemaVersion=1, protocol=labels.get('io.shukezhinao.codex.protocol'), sdkVersion=labels.get('io.shukezhinao.codex.sdk-version'))
++            identity = codex_module().runtime_identity_from_labels(labels)
 +            codex = codex_module().probe(codex_context(), containers['api']['Id'], identity)
 +        except Exception: failures.append('CODEX_PRIVATE_HEALTH')
      http_checks = {}

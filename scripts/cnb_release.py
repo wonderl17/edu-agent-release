@@ -15,6 +15,9 @@ RUNTIME_ROOT = "tools/codex-agent-runtime/"
 RUNTIME_FILES = tuple(RUNTIME_ROOT + name for name in ("release.json", "package.json", "package-lock.json", "Dockerfile"))
 RUNTIME_PROTOCOL = "teaching-codex-plan-v1"
 RUNTIME_LABELS = {"protocol": "io.shukezhinao.codex.protocol", "sdkVersion": "io.shukezhinao.codex.sdk-version"}
+NATIVE_RUNTIME_LABELS = {"protocol": RUNTIME_LABELS["protocol"], "engine": "io.shukezhinao.codex.engine",
+                         "runtimeVersion": "io.shukezhinao.codex.runtime-version"}
+SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
 
 def canonical(value):
@@ -22,12 +25,29 @@ def canonical(value):
 
 
 def validate_runtime(value):
-    if (not isinstance(value, dict) or set(value) != {"schemaVersion", "protocol", "sdkVersion"} or
-            type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1 or
-            value["protocol"] != RUNTIME_PROTOCOL or not isinstance(value["sdkVersion"], str) or
-            not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value["sdkVersion"])):
+    if (not isinstance(value, dict) or type(value.get("schemaVersion")) is not int or
+            value.get("protocol") != RUNTIME_PROTOCOL):
         raise ValueError("runtime identity")
-    return value
+    if (value["schemaVersion"] == 1 and set(value) == {"schemaVersion", "protocol", "sdkVersion"} and
+            isinstance(value["sdkVersion"], str) and SEMVER.fullmatch(value["sdkVersion"])):
+        return value
+    if (value["schemaVersion"] == 2 and set(value) == {"schemaVersion", "protocol", "engine", "runtimeVersion"} and
+            value["engine"] == "responses" and isinstance(value["runtimeVersion"], str) and
+            SEMVER.fullmatch(value["runtimeVersion"])):
+        return value
+    raise ValueError("runtime identity")
+
+
+def runtime_labels(runtime):
+    validate_runtime(runtime)
+    keys = RUNTIME_LABELS if runtime["schemaVersion"] == 1 else NATIVE_RUNTIME_LABELS
+    return {label: runtime[key] for key, label in keys.items()}
+
+
+def validate_native_package(runtime, package):
+    return (isinstance(package, dict) and package.get("name") == "@teaching-ai-agent/codex-runtime" and
+            package.get("version") == runtime["runtimeVersion"] and
+            all(package.get(key, {}) == {} for key in ("dependencies", "optionalDependencies", "peerDependencies", "devDependencies")))
 
 
 def source_runtime(read_file):
@@ -40,14 +60,18 @@ def source_runtime(read_file):
         package = json.loads(read_file(RUNTIME_FILES[1]))
         lock = json.loads(read_file(RUNTIME_FILES[2]))
         dockerfile = read_file(RUNTIME_FILES[3])
-        version = runtime["sdkVersion"]
-        valid = (package["name"] == "@teaching-ai-agent/codex-runtime" and
-                 package["dependencies"]["@openai/codex-sdk"] == version and
-                 lock["packages"][""]["dependencies"]["@openai/codex-sdk"] == version and
-                 lock["packages"]["node_modules/@openai/codex-sdk"]["version"] == version and bool(dockerfile))
+        if runtime["schemaVersion"] == 1:
+            version = runtime["sdkVersion"]
+            valid = (package["name"] == "@teaching-ai-agent/codex-runtime" and
+                     package["dependencies"]["@openai/codex-sdk"] == version and
+                     lock["packages"][""]["dependencies"]["@openai/codex-sdk"] == version and
+                     lock["packages"]["node_modules/@openai/codex-sdk"]["version"] == version)
+        else:
+            valid = (validate_native_package(runtime, package) and set(lock["packages"]) == {""} and
+                     validate_native_package(runtime, lock["packages"][""]))
     except (KeyError, TypeError, ValueError):
         valid = False
-    if not valid:
+    if not valid or not dockerfile:
         raise ValueError("runtime source dependency identity")
     return runtime
 
@@ -75,16 +99,26 @@ def inspect_runtime_image(runtime, image_ref, directory, run, remove):
         target.mkdir(mode=0o700)
         created = True
         values = []
-        for name, source in (("release", "/app/release.json"), ("package", "/app/package.json"),
-                             ("sdk", "/app/node_modules/@openai/codex-sdk/package.json")):
+        paths = [("release", "/app/release.json"), ("package", "/app/package.json")]
+        if runtime["schemaVersion"] == 1:
+            paths.append(("sdk", "/app/node_modules/@openai/codex-sdk/package.json"))
+        for name, source in paths:
             path = target / (name + ".json")
             run(["cp", container + ":" + source, str(path)])
             info = path.lstat()
             if not stat.S_ISREG(info.st_mode) or path.resolve() != path or info.st_size > 16384:
                 raise ValueError("runtime image metadata file")
             values.append(json.loads(path.read_bytes()))
-        release, package, sdk = values
-        if (not isinstance(package, dict) or not isinstance(sdk, dict) or release != runtime or
+        release, package, *installed = values
+        if release != runtime:
+            raise ValueError("runtime image dependency identity")
+        if runtime["schemaVersion"] == 2:
+            if not validate_native_package(runtime, package):
+                raise ValueError("runtime image dependency identity")
+            return dict(protocol=runtime["protocol"], engine=runtime["engine"],
+                        runtimeVersion=runtime["runtimeVersion"], runtimeMetadataVerified=True)
+        sdk = installed[0]
+        if (not isinstance(package, dict) or not isinstance(sdk, dict) or
                 package.get("name") != "@teaching-ai-agent/codex-runtime" or
                 package.get("dependencies", {}).get("@openai/codex-sdk") != runtime["sdkVersion"] or
                 sdk.get("name") != "@openai/codex-sdk" or sdk.get("version") != runtime["sdkVersion"]):

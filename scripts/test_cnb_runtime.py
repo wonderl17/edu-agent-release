@@ -20,6 +20,7 @@ fixture = release_tests.fixture
 
 
 RUNTIME = dict(schemaVersion=1, protocol='teaching-codex-plan-v1', sdkVersion='0.165.0')
+NATIVE = dict(schemaVersion=2, protocol=RUNTIME['protocol'], engine='responses', runtimeVersion='0.2.0')
 
 
 def package_files():
@@ -40,6 +41,22 @@ def manifest():
 
 
 class RuntimeContractTests(unittest.TestCase):
+    def test_native_runner_binds_package_version_without_requiring_codex(self):
+        files = package_files()
+        package = dict(name='@teaching-ai-agent/codex-runtime', version='0.2.0')
+        files.update(dict(zip(contract.RUNTIME_FILES[:3], map(contract.canonical,
+            [NATIVE, package, dict(packages={'': package})]))))
+        self.assertEqual(contract.source_runtime(files.get), NATIVE)
+        value = manifest(); value['runtime'] = NATIVE
+        self.assertIs(contract.validate_manifest(value, 'a'*40, '0.0.126'), value)
+        self.assertEqual(contract.runtime_labels(NATIVE)['io.shukezhinao.codex.engine'], 'responses')
+        self.assertNotIn('io.shukezhinao.codex.sdk-version', contract.runtime_labels(NATIVE))
+        for change in (dict(version='0.1.0'), dict(dependencies={'@openai/codex-sdk': '0.165.0'})):
+            invalid = dict(files)
+            invalid[contract.RUNTIME_FILES[1]] = contract.canonical(package | change)
+            with self.assertRaisesRegex(ValueError, 'dependency identity'):
+                contract.source_runtime(invalid.get)
+
     def test_old_and_new_manifests_have_exact_distinct_image_contracts(self):
         for value in (fixture(), manifest()):
             self.assertIs(contract.validate_manifest(value, 'a'*40, '0.0.126'), value)
@@ -164,6 +181,23 @@ class RuntimeContractTests(unittest.TestCase):
 
 
 class RuntimeImageTests(unittest.TestCase):
+    def test_native_image_uses_only_planner_metadata_and_never_loads_a_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            values = {'release': NATIVE, 'package': dict(name='@teaching-ai-agent/codex-runtime', version='0.2.0')}
+            commands = []
+            def run(args):
+                commands.append(args)
+                if args[0] == 'create': return ('a'*64+'\n').encode()
+                self.assertEqual(args[0], 'cp')
+                path = Path(args[-1])
+                path.write_bytes(contract.canonical(values[path.stem]))
+                return b''
+            receipt = contract.inspect_runtime_image(NATIVE, manifest()['images']['codex-runtime']['ref'],
+                                                     directory, run, commands.append)
+            self.assertEqual(receipt, dict(protocol=RUNTIME['protocol'], engine='responses',
+                                           runtimeVersion='0.2.0', runtimeMetadataVerified=True))
+            self.assertEqual([args[0] for args in commands], ['create', 'cp', 'cp', 'rm'])
+
     def inspect(self, root, change=None, fault=None):
         values = { 'release': copy.deepcopy(RUNTIME),
                    'package': json.loads(package_files()[contract.RUNTIME_FILES[1]]),

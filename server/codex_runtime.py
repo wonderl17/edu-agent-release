@@ -54,10 +54,25 @@ def load_settings(ops):
 
 
 def runtime_identity(value):
-    require(isinstance(value, dict) and set(value) == {'schemaVersion', 'protocol', 'sdkVersion'} and
-            type(value['schemaVersion']) is int and value['schemaVersion'] == 1 and value['protocol'] == PROTOCOL and
-            isinstance(value['sdkVersion'], str) and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', value['sdkVersion']), 'CODEX_RUNTIME_PROTOCOL')
+    require(isinstance(value, dict) and type(value.get('schemaVersion')) is int and
+            value.get('protocol') == PROTOCOL, 'CODEX_RUNTIME_PROTOCOL')
+    version = value.get('sdkVersion') if value['schemaVersion'] == 1 else value.get('runtimeVersion')
+    require(isinstance(version, str) and re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version) and
+            ((value['schemaVersion'] == 1 and set(value) == {'schemaVersion', 'protocol', 'sdkVersion'}) or
+             (value['schemaVersion'] == 2 and set(value) == {'schemaVersion', 'protocol', 'engine', 'runtimeVersion'} and
+              value['engine'] == 'responses')), 'CODEX_RUNTIME_PROTOCOL')
     return value
+
+
+def runtime_identity_from_labels(labels):
+    protocol = labels.get('io.shukezhinao.codex.protocol')
+    sdk = labels.get('io.shukezhinao.codex.sdk-version')
+    engine = labels.get('io.shukezhinao.codex.engine')
+    runtime = labels.get('io.shukezhinao.codex.runtime-version')
+    if engine is None and runtime is None:
+        return runtime_identity(dict(schemaVersion=1, protocol=protocol, sdkVersion=sdk))
+    require(sdk is None, 'CODEX_RUNTIME_PROTOCOL')
+    return runtime_identity(dict(schemaVersion=2, protocol=protocol, engine=engine, runtimeVersion=runtime))
 
 
 def extension(image, runtime, config):
@@ -156,8 +171,7 @@ def trusted_extension(ops, image, approved_settings=None):
     config = actual.get('Config', {}); labels = config.get('Labels', {})
     require(image in actual.get('RepoDigests', []) and actual.get('Os') == 'linux' and actual.get('Architecture') == 'amd64' and
             config.get('User') == 'node' and config.get('Cmd') == ['node','server.mjs'] and not config.get('Entrypoint'), 'CODEX_IMAGE_IDENTITY')
-    identity = runtime_identity(dict(schemaVersion=1, protocol=labels.get('io.shukezhinao.codex.protocol'),
-                                     sdkVersion=labels.get('io.shukezhinao.codex.sdk-version')))
+    identity = runtime_identity_from_labels(labels)
     return extension(image, identity, load_settings(ops) if approved_settings is None else settings(approved_settings))
 
 
